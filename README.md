@@ -12,6 +12,6 @@ Xin Wang<sup>1</sup>, Kai Chen<sup>1</sup>, Jiaming Zhang<sup>2</sup>, Jingjing 
 --- 
 
 <p align="center">
-<img src="./asserts/fig3.pdf" width=100% height=100% 
+<img src="./asserts/fig3.png" width=100% height=100% 
 class="center">
 </p>
