@@ -1152,60 +1152,7 @@ class TAPTVLJ(TrainerX):
         return 0.5 * (F.kl_div(F.log_softmax(p, dim=-1), F.softmax(m, dim=-1), reduction='batchmean') + F.kl_div(F.log_softmax(q, dim=-1), F.softmax(m, dim=-1), reduction='batchmean'))
 
     @torch.no_grad()
-    def save_and_compute_feature_maps(self, split=None, save_path='./output/TTAPT/features/'):
-        """
-        Saving feature maps (i.e. tokens from transformer)
-        """
-        self.set_model_mode("eval")
-        self.evaluator.reset()
-
-        if split is None:
-            split = self.cfg.TEST.SPLIT
-
-        if split == "val" and self.val_loader is not None:
-            data_loader = self.val_loader
-        elif split == "test":   # in case val_loader is None
-            data_loader = self.test_loader
-        elif split == "train":  # in case val_loader is None
-            data_loader = self.train_loader_x
-
-        print(f"Calculate var and mean on the *{split}* set")        
-        all_visual_feats = []
-
-        for batch_idx, batch in enumerate(tqdm(data_loader)):
-            input, label = self.parse_batch_test(batch)
-            output = self.model_inference(input)
-
-            visual_feats = torch.stack([res.visual_feat.permute(1, 0, 2) for res in self.model.image_encoder.transformer.resblocks], dim=1)
-            all_visual_feats.append(visual_feats.cpu())
-
-            # Process output and labels
-            self.evaluator.process(output, label)
-
-        # Concatenate all the visual features across batches and compute the mean
-        all_visual_feats = torch.cat(all_visual_feats, dim=0)
-        print("all_visual_feats shape: ", all_visual_feats.shape)
-
-        # mean_visual_feat = all_visual_feats.mean(dim=0).cuda()
-        var_visual_feat = all_visual_feats.var(dim=0).cuda()
-
-        del all_visual_feats
-
-        print(f"******Saving feature maps to {save_path}*********")
-        # torch.save(mean_visual_feat, save_path + "ImgNetpre_vis_means_{}_half_eps4_ep100_{}shot.pt".format(split, self.cfg.DATASET.NUM_SHOTS))
-        torch.save(var_visual_feat, save_path + "ImgNetpre_vis_vars_{}_half_eps4_ep100_{}shot.pt".format(split, self.cfg.DATASET.NUM_SHOTS))
-
-        results = self.evaluator.evaluate()
-
-        # Save evaluation results
-        for k, v in results.items():
-            tag = f"{split}/{k}"
-            self.write_scalar(tag, v, self.epoch)
-
-        return list(results.values())[0]
-
-    @torch.no_grad()
-    def save_and_compute_means(self, split=None, save_path='./output/TTAPT/features/'):
+    def save_and_compute_means(self, split=None, save_path='./statistics/VLJ/'):
         """
         Saving feature maps (i.e. tokens from transformer) and calculating mean in batches
         """
@@ -1248,12 +1195,12 @@ class TAPTVLJ(TrainerX):
         mean_visual_feat = running_mean.cuda()
 
         print(f"******Saving means embedding to {save_path}*********")
-        torch.save(mean_visual_feat, save_path + "ImgNetpre_vis_means_{}_half_eps4_ep100_0shot_vit32.pt".format(split))
+        torch.save(mean_visual_feat, save_path + "imagenet_means.pt")
 
         self.save_and_compute_var(split, mean_visual_feat, data_loader, save_path)
 
     @torch.no_grad()
-    def save_and_compute_var(self, split=None, mean_visual_feat=None, data_loader=None, save_path='./output/TTAPT/features/'):
+    def save_and_compute_var(self, split=None, mean_visual_feat=None, data_loader=None, save_path='./statistics/VLJ/'):
         """
         Saving feature maps (i.e. tokens from transformer) and calculating variance in batches
         """
@@ -1289,7 +1236,7 @@ class TAPTVLJ(TrainerX):
         var_visual_feat = var_visual_feat.cuda()
 
         print(f"******Saving vars embedding to {save_path}*********")
-        torch.save(var_visual_feat, save_path + "ImgNetpre_vis_vars_{}_half_eps4_ep100_0shot_vit32.pt".format(split))
+        torch.save(var_visual_feat, save_path + "imagenet_vars.pt")
 
         results = self.evaluator.evaluate()
         for k, v in results.items():
