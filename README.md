@@ -55,7 +55,7 @@ This repository is built upon [`PromptAlign`](https://github.com/jameelhassan/Pr
 
 ```
 @inproceedings{wang2025tapt,
-  title={TAPT: Test-time adversarial prompt tuning for robust inference in vision-language models},
+  title={TAPT: Test-Time Adversarial Prompt Tuning for Robust Inference in Vision-Language Models},
   author={Wang, Xin and Chen, Kai and Zhang, Jiaming and Chen, Jingjing and Ma, Xingjun},
   booktitle={Proceedings of the Computer Vision and Pattern Recognition Conference},
   pages={19910--19920},
