@@ -2,10 +2,6 @@
 
 Official PyTorch implementation of the following paper:
 
-TAPT: Test-Time Adversarial Prompt Tuning for Robust Inference in Vision-Language Models, CVPR 2025.
-
-<br>
-
 <div style="text-align: center; margin-top: 0px;">
   <a href="https://openaccess.thecvf.com/content/CVPR2025/papers/Wang_TAPT_Test-Time_Adversarial_Prompt_Tuning_for_Robust_Inference_in_Vision-Language_CVPR_2025_paper.pdf" target="_blank" style="text-decoration: none; color: #007acc;">
     TAPT: Test-Time Adversarial Prompt Tuning for Robust Inference in Vision-Language Models,
