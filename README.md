@@ -25,7 +25,7 @@ To set up the required environment, please follow the installation instructions 
 
 # Data Preparation
 
-Before training or evaluating the models, you'll need to prepare the necessary datasets. Detailed instructions on downloading, preprocessing, and organizing the data can be found in [DATASETS.md](docs/DATASETS.md).
+Before training or evaluating the models, you'll need to prepare the necessary datasets. Detailed instructions on downloading, preprocessing, and organizing the data can be found in [DATASETS.md](https://github.com/KaiyangZhou/CoOp/blob/main/DATASETS.md).
 
 ADV_DIR can be generated using the [Train-Time APT repository](https://github.com/xinwong/Multimodal-Adversarial-Prompt-Tuning.git).
 
