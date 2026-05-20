@@ -9,7 +9,7 @@ DATASETS=("caltech101" "dtd" "eurosat" "oxford_pets" "fgvc_aircraft" "oxford_flo
 SEED=1
 EPOCHS=(100)
 
-WEIGHTSPATH='/path/to/TAPT++/Multimodal-Adversarial-Prompt-Tuning/output/train/imagenet/AdvMaPLe/vit_b16_c2_ep100_batch32_2ctx_9depth_cross_datasets_16shots'
+WEIGHTSPATH='/path/to/MMoP/output/train/imagenet/AdvMaPLe/vit_b16_c2_ep100_batch32_2ctx_9depth_cross_datasets_16shots'
 
 CFG=TAPT_vit_b16_c2_ep100_batch32_2ctx_9depth_l1_cross_datasets_step1_clean
 SHOTS=0
@@ -55,7 +55,7 @@ DATASETS=("caltech101" "dtd" "eurosat" "oxford_pets" "fgvc_aircraft" "oxford_flo
 SEED=1
 EPOCHS=(100)
 
-WEIGHTSPATH='/path/to/TAPT++/Multimodal-Adversarial-Prompt-Tuning/output/train/imagenet/AdvMaPLe/vit_b16_c2_ep100_batch32_2ctx_9depth_cross_datasets_16shots'
+WEIGHTSPATH='/path/to/MMoP/output/train/imagenet/AdvMaPLe/vit_b16_c2_ep100_batch32_2ctx_9depth_cross_datasets_16shots'
 
 # Extract the common part from WEIGHTSPATH
 COMMON_PART=$(basename ${WEIGHTSPATH})

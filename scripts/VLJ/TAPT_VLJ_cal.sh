@@ -9,8 +9,8 @@ DATASETS=("imagenet")
 SEED=1
 EPOCHS=(100)
 
-# WEIGHTSPATH='/path/to/TAPT++/Multimodal-Adversarial-Prompt-Tuning/output2025/train/imagenet/AdvMaPLe/vit_b32_c2_ep100_batch32_2ctx_9depth_cross_datasets_16shots'             # adv
-WEIGHTSPATH='/path/to/TAPT++/Multimodal-Adversarial-Prompt-Tuning/output2025/train/imagenet/AdvMaPLe/vit_b32_c2_ep100_batch32_2ctx_9depth_cross_datasets_clean_16shots'     # clean
+# WEIGHTSPATH='/path/to/MMoP/output/train/imagenet/AdvMaPLe/vit_b32_c2_ep100_batch32_2ctx_9depth_cross_datasets_16shots'             # adv
+WEIGHTSPATH='/path/to/MMoP/output/train/imagenet/AdvMaPLe/vit_b32_c2_ep100_batch32_2ctx_9depth_cross_datasets_clean_16shots'     # clean
 
 CFG=TAPT_vit_b32_c2_ep100_batch32_2ctx_9depth_cal
 SHOTS=0

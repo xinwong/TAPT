@@ -10,7 +10,7 @@ SEED=1
 EPOCHS=(100)
 ATTACKS=("pgd" "di")
 
-WEIGHTSPATH='/path/to/PromptLearning/Multimodal-Adversarial-Prompt-Tuning/output2025/train/imagenet/MoEAdvMaPLe/vit_b32_c2_ep100_batch32_2ctx_9depth_cross_datasets_16shots'
+WEIGHTSPATH='/path/to/MMoP/output/train/imagenet/MoEAdvMaPLe/vit_b32_c2_ep100_batch32_2ctx_9depth_cross_datasets_16shots'
 
 COMMON_PART=$(basename ${WEIGHTSPATH})
 
@@ -21,7 +21,7 @@ MODEL_DIR=${WEIGHTSPATH}/seed${SEED}
 
 for ATTACK in "${ATTACKS[@]}"; do
 
-    ADV_DIR=/path/to/TAPT/output2025/evaluation/${ATTACK}/MoEAdvMaPLe
+    ADV_DIR=/path/to/MMoP/output/evaluation/${ATTACK}/MoEAdvMaPLe
 
     for DATASET in "${DATASETS[@]}"; do
         for LOADEP in "${EPOCHS[@]}"; do
