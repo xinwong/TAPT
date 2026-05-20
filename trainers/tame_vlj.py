@@ -12,6 +12,7 @@ from dassl.metrics import compute_accuracy
 from dassl.utils import load_pretrained_weights, load_checkpoint
 from dassl.optim import build_optimizer, build_lr_scheduler
 
+# TAPT imports
 from copy import deepcopy
 import torch.backends.cudnn as cudnn
 import os
@@ -29,18 +30,77 @@ import json
 import random
 from torch.utils.data import Dataset
 import numpy as np
-from utils import Summary, ProgressMeter, accuracy, load_model_weight, set_random_seed, AverageMeter
+from utils import Summary, ProgressMeter, accuracy, load_model_weight, set_random_seed
+from utils import AverageMeter as AverageMeter_TAPT
 import time
 from tqdm import tqdm
+
+from pdb import set_trace as stx
 
 from clip import clip
 from clip import tokenize
 from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 
+import torchattacks
+
 _tokenizer = _Tokenizer()
+
+from fvcore.nn import FlopCountAnalysis
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
+
+MOE_STATE_NAMES = ("expert_prompts", "gate", "tau", "alpha", "base_prompt")
+
+
+def is_moe_state_parameter(name):
+    return any(key in name for key in MOE_STATE_NAMES)
+
+
+def is_trainable_moe_parameter(name, train_tau=True, train_base_prompt=True):
+    if "tau" in name and not train_tau:
+        return False
+    if "base_prompt" in name and not train_base_prompt:
+        return False
+    return is_moe_state_parameter(name)
+
+
+def unwrap_model(model):
+    return model.module if isinstance(model, nn.DataParallel) else model
+
+
+def is_moe_gate_parameter(name):
+    return "gate.weight" in name or "gate.bias" in name
+
+
+def is_moe_scale_parameter(name):
+    return ("alpha" in name) or ("tau" in name)
+
+
+def build_moe_param_groups(model, base_lr, weight_decay, lr_mult_gate, lr_mult_scale):
+    prompt_params = []
+    gate_params = []
+    scale_params = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if is_moe_scale_parameter(name):
+            scale_params.append(param)
+        elif is_moe_gate_parameter(name):
+            gate_params.append(param)
+        else:
+            prompt_params.append(param)
+
+    param_groups = []
+    if prompt_params:
+        param_groups.append({"params": prompt_params, "lr": base_lr, "weight_decay": weight_decay})
+    if gate_params:
+        param_groups.append({"params": gate_params, "lr": base_lr * lr_mult_gate, "weight_decay": weight_decay})
+    if scale_params:
+        param_groups.append({"params": scale_params, "lr": base_lr * lr_mult_scale, "weight_decay": 0.0})
+
+    return param_groups
 
 class TransformDataset(Dataset):
     def __init__(self, dataset, transform=None):
@@ -57,6 +117,7 @@ class TransformDataset(Dataset):
         return image, label
 
 def load_clip_to_cpu(cfg):
+    moe_cfg = cfg.TRAINER.TAMEVLJ
     backbone_name = cfg.MODEL.BACKBONE.NAME
     url = clip._MODELS[backbone_name]
     model_path = clip._download(url)
@@ -68,11 +129,40 @@ def load_clip_to_cpu(cfg):
 
     except RuntimeError:
         state_dict = torch.load(model_path, map_location="cpu")
-    design_details = {"trainer": 'IVLP',
-                      "vision_depth": cfg.TRAINER.TAPTVLI.PROMPT_DEPTH_VISION,
-                      "language_depth": cfg.TRAINER.TAPTVLI.PROMPT_DEPTH_TEXT,
-                      "vision_ctx": cfg.TRAINER.TAPTVLI.N_CTX_VISION,
-                      "language_ctx": cfg.TRAINER.TAPTVLI.N_CTX_TEXT}
+    design_details = {"trainer": 'TAME_VLJ',
+                      "vision_depth": 0,
+                      "language_depth": 0, "vision_ctx": 0,
+                      "language_ctx": 0,
+                      "maple_length": moe_cfg.N_CTX,
+                      "num_experts": moe_cfg.NUM_EXPERTS,
+                      "delta_scale_init": moe_cfg.DELTA_SCALE_INIT,
+                      "gate_mode": moe_cfg.GATE_MODE,
+                      "gate_hybrid_lambda": moe_cfg.GATE_HYBRID_LAMBDA,
+                      "alpha_min": moe_cfg.ALPHA_MIN,
+                      "alpha_max": moe_cfg.ALPHA_MAX,
+                      "tau_min": moe_cfg.TAU_MIN,
+                      "tau_max": moe_cfg.TAU_MAX}
+    model = clip.build_model(state_dict or model.state_dict(), design_details)
+
+    return model
+
+def load_clip_to_cpu_dummy(cfg):
+    backbone_name = cfg.MODEL.BACKBONE.NAME
+    url = clip._MODELS[backbone_name]
+    model_path = clip._download(url)
+
+    try:
+        # loading JIT archive
+        model = torch.jit.load(model_path, map_location="cpu").eval()
+        state_dict = None
+
+    except RuntimeError:
+        state_dict = torch.load(model_path, map_location="cpu")
+    design_details = {"trainer": 'MaPLe',
+                      "vision_depth": 0,
+                      "language_depth": 0, 
+                      "vision_ctx": 0,
+                      "language_ctx": 0}
     model = clip.build_model(state_dict or model.state_dict(), design_details)
 
     return model
@@ -87,10 +177,13 @@ class TextEncoder(nn.Module):
         self.text_projection = clip_model.text_projection
         self.dtype = clip_model.dtype
 
-    def forward(self, prompts, tokenized_prompts):
+    def forward(self, prompts, tokenized_prompts, compound_prompts_deeper_text):
         x = prompts + self.positional_embedding.type(self.dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
+        # Pass as the list, as nn.sequential cannot process multiple arguments in the forward pass
+        combined = [x, compound_prompts_deeper_text, 0]  # third argument is the counter which denotes depth of prompt
+        outputs = self.transformer(combined)
+        x = outputs[0]  # extract the x back from here
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.ln_final(x).type(self.dtype)
 
@@ -101,22 +194,22 @@ class TextEncoder(nn.Module):
         return x
 
 
-class VLPromptLearner(nn.Module):
+class MultiModalPromptLearner(nn.Module):
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
+        moe_cfg = cfg.TRAINER.TAMEVLJ
         self.learned_cls = False  # Just copied, check if setting to True
         n_cls = len(classnames)
-        # Make sure Language depth >= 1
-        assert cfg.TRAINER.TAPTVLI.PROMPT_DEPTH_TEXT >= 1, "In Independent VL prompting, Language prompt depth should be >=1" \
-                                                        "\nPlease use VPT trainer if you want to learn only vision " \
-                                                        "branch  "
-        n_ctx = cfg.TRAINER.TAPTVLI.N_CTX_TEXT
-        ctx_init = cfg.TRAINER.TAPTVLI.CTX_INIT
+        n_ctx = moe_cfg.N_CTX
+        ctx_init = moe_cfg.CTX_INIT
         dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
-        vis_dim = clip_model.visual.output_dim
+        vision_ctx_dim = clip_model.visual.conv1.weight.shape[0]
         clip_imsize = clip_model.visual.input_resolution
         cfg_imsize = cfg.INPUT.SIZE[0]
+        # Default is 1, which is compound shallow prompting
+        assert moe_cfg.PROMPT_DEPTH >= 1, "For MaPLe, PROMPT_DEPTH should be >= 1"
+        self.compound_prompts_depth = moe_cfg.PROMPT_DEPTH  # max=12, but will create 11 such shared prompts
         assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
 
         if ctx_init and (n_ctx) <= 4:
@@ -133,11 +226,34 @@ class VLPromptLearner(nn.Module):
             ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
             nn.init.normal_(ctx_vectors, std=0.02)
             prompt_prefix = " ".join(["X"] * n_ctx)
-        print(f"Adversarial Independent V-L design")
-        print(f'Initial text context: "{prompt_prefix}"')
-        print(f"Number of context words (tokens) for Language prompting: {n_ctx}")
-        print(f"Number of context words (tokens) for Vision prompting: {cfg.TRAINER.TAPTVLI.N_CTX_VISION}")
+        print('TAME-VLJ design: Multi-modal Prompt Learning')
+        print(f'Initial context: "{prompt_prefix}"')
+        print(f"Number of MaPLe context words (tokens): {n_ctx}")
+        # These below, related to the shallow prompts
+        # Linear layer so that the tokens will project to 512 and will be initialized from 768
+        self.proj = nn.Linear(ctx_dim, vision_ctx_dim)
+        # self.proj.half()
         self.ctx = nn.Parameter(ctx_vectors)
+        self.proj_weight_init_state = self.proj.weight.detach().clone()
+        self.proj_bias_init_state = self.proj.bias.detach().clone()
+        self.ctx_init_state = ctx_vectors.detach().clone()
+
+        # These below parameters related to the shared prompts
+        # Define the compound prompts for the deeper layers
+
+        # Minimum can be 1, which defaults to shallow MaPLe
+        # compound prompts
+        self.compound_prompts_text = nn.ParameterList([nn.Parameter(torch.empty(n_ctx, ctx_dim))
+                                                      for _ in range(self.compound_prompts_depth - 1)])
+        for single_para in self.compound_prompts_text:
+            nn.init.normal_(single_para, std=0.02)
+        # Copy init state
+        self.compound_prompts_text_init_state = [txt_prompt.detach().clone() for txt_prompt in self.compound_prompts_text]
+
+        # Also make corresponding projection layers, for each prompt
+        single_layer = nn.Linear(ctx_dim, vision_ctx_dim)
+        self.compound_prompt_projections = _get_clones(single_layer, self.compound_prompts_depth - 1)
+        self.compound_prompt_projections_init_state = [(module.weight.detach().clone(), module.bias.detach().clone()) for module in self.compound_prompt_projections]
 
         classnames = [name.replace("_", " ") for name in classnames]
         name_lens = [len(_tokenizer.encode(name)) for name in classnames]
@@ -157,7 +273,6 @@ class VLPromptLearner(nn.Module):
         self.n_ctx = n_ctx
         self.tokenized_prompts = tokenized_prompts  # torch.Tensor
         self.name_lens = name_lens
-
 
     def construct_prompts(self, ctx, prefix, suffix, label=None):
         # dim0 is either batch_size (during training) or n_cls (during testing)
@@ -182,6 +297,7 @@ class VLPromptLearner(nn.Module):
 
     def forward(self):
         ctx = self.ctx
+
         if ctx.dim() == 2:
             ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
 
@@ -189,8 +305,15 @@ class VLPromptLearner(nn.Module):
         suffix = self.token_suffix
         prompts = self.construct_prompts(ctx, prefix, suffix)
 
-        return prompts
-
+        # Before returning, need to transform
+        # prompts to 768 for the visual side
+        visual_deep_prompts = []
+        for index, layer in enumerate(self.compound_prompt_projections):
+            visual_deep_prompts.append(layer(self.compound_prompts_text[index]))
+        # Now the other way around
+        # We will project the textual prompts from 512 to 768
+        return prompts, self.proj(self.ctx), self.compound_prompts_text, visual_deep_prompts   # pass here original, as for visual 768 is required
+    
     def reset(self):
         ctx_vectors = self.ctx_init_state
         self.ctx.copy_(ctx_vectors) # to be optimized
@@ -198,9 +321,18 @@ class VLPromptLearner(nn.Module):
             cls_vectors = self.cls_init_state
             self.cls.copy_(cls_vectors)
 
+        with torch.no_grad():
+            self.proj.weight.copy_(self.proj_weight_init_state)
+            self.proj.bias.copy_(self.proj_bias_init_state)
+
+            for idx, prompt in enumerate(self.compound_prompts_text):
+                prompt.copy_(self.compound_prompts_text_init_state[idx])
+            
+            for idx, module in enumerate(self.compound_prompt_projections):
+                module.weight.copy_(self.compound_prompt_projections_init_state[idx][0])
+                module.bias.copy_(self.compound_prompt_projections_init_state[idx][1])
+
     def reset_classnames(self, classnames, args):
-        print("==================================")
-        print(args)
         self.device = self.ctx.device
         self.n_cls = len(classnames)
         if not self.learned_cls:
@@ -236,23 +368,45 @@ class VLPromptLearner(nn.Module):
         '''
         ctx_vectors = self.ctx.detach().clone()
         self.ctx_init_state = ctx_vectors
+        self.proj_weight_init_state = self.proj.weight.detach().clone()
+        self.proj_bias_init_state = self.proj.bias.detach().clone()
+
+        self.compound_prompts_text_init_state = [txt_prompt.detach().clone() for txt_prompt in self.compound_prompts_text]
+        self.compound_prompt_projections_init_state = [(module.weight.detach().clone(), module.bias.detach().clone()) for module in self.compound_prompt_projections]
 
 
 class CustomCLIP(nn.Module):
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
-        self.prompt_learner = VLPromptLearner(cfg, classnames, clip_model)
+        self.cfg = cfg
+        self.moe_cfg = cfg.TRAINER.TAMEVLJ
+        self.prompt_learner = MultiModalPromptLearner(cfg, classnames, clip_model)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoder(clip_model)
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
-        self.vpt_initial_states = {}
-        for name, param in self.named_parameters():
-            if "VPT" in name:
-                self.vpt_initial_states[name] = param.detach().clone()
-                
+        self.moe_aux_loss_scale = 1.0
         self.normalize = transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])
+        self.moe_initial_states = {}
+        for name, param in self.named_parameters():
+            if is_moe_state_parameter(name):
+                self.moe_initial_states[name] = param.detach().clone()
+
+    def compute_moe_aux_loss(self):
+        total_balance = self.logit_scale.new_tensor(0.0)
+        total_diversity = self.logit_scale.new_tensor(0.0)
+        for transformer in (self.image_encoder.transformer, self.text_encoder.transformer):
+            if hasattr(transformer, "moe_aux_losses"):
+                balance, diversity = transformer.moe_aux_losses()
+                total_balance = total_balance + balance
+                total_diversity = total_diversity + diversity
+        balance_w = getattr(self.moe_cfg, "AUX_BALANCE_W_TARGET", self.moe_cfg.AUX_BALANCE_W)
+        diversity_w = getattr(self.moe_cfg, "AUX_DIVERSITY_W_TARGET", self.moe_cfg.AUX_DIVERSITY_W)
+        return self.moe_aux_loss_scale * (balance_w * total_balance + diversity_w * total_diversity)
+
+    def set_moe_aux_loss_scale(self, scale):
+        self.moe_aux_loss_scale = float(scale)
 
     def forward(self, image, label=None):
         image = self.normalize(image)
@@ -260,35 +414,37 @@ class CustomCLIP(nn.Module):
         tokenized_prompts = self.tokenized_prompts
         logit_scale = self.logit_scale.exp()
 
-        prompts = self.prompt_learner()
-        text_features = self.text_encoder(prompts, tokenized_prompts)
-        image_features = self.image_encoder(image.type(self.dtype))
+        prompts, shared_ctx, deep_compound_prompts_text, deep_compound_prompts_vision = self.prompt_learner()
+        text_features = self.text_encoder(prompts, tokenized_prompts, deep_compound_prompts_text)
+        image_features = self.image_encoder(image.type(self.dtype), shared_ctx, deep_compound_prompts_vision)
 
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         logits = logit_scale * image_features @ text_features.t()
 
         if self.prompt_learner.training:
-            return F.cross_entropy(logits, label)
-
+            return F.cross_entropy(logits, label) + self.compute_moe_aux_loss()
+               
         return logits
+    
 
     def get_text_features(self):
         with torch.no_grad():
             tokenized_prompts = self.tokenized_prompts
 
-            prompts = self.prompt_learner()
-            text_features = self.text_encoder(prompts, tokenized_prompts)
+            prompts, shared_ctx, deep_compound_prompts_text, deep_compound_prompts_vision = self.prompt_learner()
+            text_features = self.text_encoder(prompts, tokenized_prompts, deep_compound_prompts_text)
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         return text_features
     
     # restore the initial state of the prompt_learner (tunable prompt)
     def reset(self):
         self.prompt_learner.reset()
+        # 恢复 MoE 相关参数
         for name, param in self.named_parameters():
-            if "VPT" in name:
-                # print(name)
-                param.copy_(self.vpt_initial_states[name])
+            if is_moe_state_parameter(name):
+                if name in self.moe_initial_states:
+                    param.copy_(self.moe_initial_states[name])
 
     def reset_classnames(self, classnames, arch):
         self.prompt_learner.reset_classnames(classnames, arch)
@@ -297,6 +453,9 @@ class CustomCLIP(nn.Module):
     def set_prompt_inits(self):
         print("Re-updating prompt initializations to current prompts.")
         self.prompt_learner.set_prompt_init_states()
+        for name, param in self.named_parameters():
+            if is_moe_state_parameter(name):
+                self.moe_initial_states[name] = param.detach().clone()
 
 
 def _get_clones(module, N):
@@ -483,10 +642,29 @@ class AdvAugMixAugmenter(object):
         views = [augmix(x, self.preprocess, self.aug_list, self.severity) for _ in range(self.n_views)]
         return [image] + views
 
-
-
 @TRAINER_REGISTRY.register()
-class TAPTVLI(TrainerX):
+class TAMEVLJ(TrainerX):
+    def save_feature_maps(self, save_path='./output/features/'):
+        '''
+        Saving feature maps (i.e. tokens from transformer)
+        '''
+
+        print("******Saving feature maps to {}*********".format(save_path))
+        visual_feats = torch.cat([res.visual_feature.permute(1, 0, 2) for res in self.model.image_encoder.transformer.resblocks])
+        text_feats = torch.cat([res.text_feature.permute(1, 0, 2) for res in self.model.text_encoder.transformer.resblocks])
+        visual_feats = visual_feats / len(self.test_loader.dataset)
+        text_feats = text_feats / len(self.test_loader.dataset)
+        print("visual_feats.shape: ", visual_feats.shape)
+        print("text_feats.shape: ", text_feats.shape)
+        torch.save(visual_feats, save_path + "_vis_vars.pt")
+        torch.save(text_feats, save_path + "_txt_vars.pt")
+
+    def build_pug_dataset(self, set_id, data_root, transform):
+        setting = set_id.split('_')[1]
+        pug_dir = pug_setting_dir[setting]
+        testdir = os.path.join(data_root, ID_to_DIRNAME['PUG'], pug_dir)
+        testset = datasets.ImageFolder(testdir, transform=transform)
+        return testset
 
     def build_fewshot_dataset(self, set_id, root, transform, mode='train', n_shot=None):
         if set_id.lower() == 'aircraft':
@@ -509,6 +687,8 @@ class TAPTVLI(TrainerX):
                 testset = self.build_fewshot_dataset(set_id, os.path.join(data_root, ID_to_DIRNAME[set_id.lower()]), transform, mode=mode, n_shot=n_shot)
             else:
                 testset = self.build_fewshot_dataset(set_id, os.path.join(data_root, ID_to_DIRNAME[set_id.lower()]), transform, mode=mode)
+        elif 'PUG' in set_id:
+            testset = self.build_pug_dataset(set_id, data_root, transform=transform)
         else:
             raise NotImplementedError
             
@@ -516,6 +696,9 @@ class TAPTVLI(TrainerX):
 
     def build_data_loader(self):
         super().build_data_loader()
+        if not self.cfg.TAPT.LOADER:
+            self.tapt_loader = None
+            return
         print("Test-Time Adversarial Loader: ", self.cfg.AT.ADVALIGN)
         if self.cfg.AT.ADVALIGN:
             self.tapt_loader = self.get_tapt_adv_dataloader(self.cfg.TAPT)
@@ -595,17 +778,33 @@ class TAPTVLI(TrainerX):
 
 
     def check_cfg(self, cfg):
-        assert cfg.TRAINER.TAPTVLI.PREC in ["fp16", "fp32", "amp"]
+        assert cfg.TRAINER.TAMEVLJ.PREC in ["fp16", "fp32", "amp"]
+
+    def get_moe_aux_loss_scale(self):
+        moe_cfg = self.cfg.TRAINER.TAMEVLJ
+        warmup_epochs = max(int(getattr(moe_cfg, "AUX_WARMUP_EPOCHS", 1)), 1)
+        current_epoch = getattr(self, "epoch", 0) + 1
+        return min(1.0, current_epoch / warmup_epochs)
+
+    def build_moe_optimizer(self, base_lr):
+        moe_cfg = self.cfg.TRAINER.TAMEVLJ
+        param_groups = build_moe_param_groups(
+            self.model,
+            base_lr=base_lr,
+            weight_decay=self.cfg.OPTIM.WEIGHT_DECAY,
+            lr_mult_gate=moe_cfg.LR_MULT_GATE,
+            lr_mult_scale=moe_cfg.LR_MULT_SCALE,
+        )
+        return build_optimizer(self.model, self.cfg.OPTIM, param_groups=param_groups)
 
     def build_model(self):
         cfg = self.cfg
         classnames = self.dm.dataset.classnames
 
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
-
         clip_model = load_clip_to_cpu(cfg)
 
-        if cfg.TRAINER.TAPTVLI.PREC == "fp32" or cfg.TRAINER.TAPTVLI.PREC == "amp":
+        if cfg.TRAINER.TAMEVLJ.PREC == "fp32" or cfg.TRAINER.TAMEVLJ.PREC == "amp":
             # CLIP's default precision is fp16
             clip_model.float()
 
@@ -614,11 +813,13 @@ class TAPTVLI(TrainerX):
 
         print("Turning off gradients in both the image and the text encoder")
         name_to_update = "prompt_learner"
+        train_tau = cfg.TRAINER.TAMEVLJ.TRAIN_TAU
+        train_base_prompt = cfg.TRAINER.TAMEVLJ.TRAIN_BASE_PROMPT
 
         for name, param in self.model.named_parameters():
             if name_to_update not in name:
                 # Make sure that VPT prompts are updated
-                if "VPT" in name:
+                if "VPT" in name or is_trainable_moe_parameter(name, train_tau, train_base_prompt):
                     param.requires_grad_(True)
                 else:
                     param.requires_grad_(False)
@@ -634,12 +835,11 @@ class TAPTVLI(TrainerX):
             load_pretrained_weights(self.model, cfg.MODEL.INIT_WEIGHTS)
 
         self.model.to(self.device)
-        # NOTE: only give prompt_learner to the optimizer
-        self.optim = build_optimizer(self.model, cfg.OPTIM)
+        self.optim = self.build_moe_optimizer(cfg.OPTIM.LR)
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
-        self.register_model("VLPromptLearner", self.model, self.optim, self.sched)
+        self.register_model("MultiModalPromptLearner", self.model, self.optim, self.sched)
 
-        self.scaler = GradScaler() if cfg.TRAINER.TAPTVLI.PREC == "amp" else None
+        self.scaler = GradScaler() if cfg.TRAINER.TAMEVLJ.PREC == "amp" else None
 
         # Note that multi-gpu training could be slow because CLIP's size is
         # big, which slows down the copy operation in DataParallel
@@ -654,8 +854,9 @@ class TAPTVLI(TrainerX):
         model = self.model
         optim = self.optim
         scaler = self.scaler
+        unwrap_model(model).set_moe_aux_loss_scale(self.get_moe_aux_loss_scale())
 
-        prec = self.cfg.TRAINER.TAPTVLI.PREC
+        prec = self.cfg.TRAINER.TAMEVLJ.PREC
         if prec == "amp":
             with autocast():
                 loss = model(image, label)
@@ -717,7 +918,7 @@ class TAPTVLI(TrainerX):
             # set strict=False
             self._models[name].load_state_dict(state_dict, strict=False)
 
-    def before_adv_align(self):
+    def before_adv_align(self, attack='PGD', eps=4/255, alpha=1/255, steps=100):
         r"""
         Arguments:
             eps (float): maximum perturbation. (Default: 4/255)
@@ -728,10 +929,7 @@ class TAPTVLI(TrainerX):
         
         adv_dataset_pkl_path = os.path.join(self.cfg.AT.ADV_DIR, self.cfg.DATASET.NAME + "_adv_dataset.pkl")
         print("load adv dataset: {}".format(adv_dataset_pkl_path))
-
-        # If inputs were normalized, then
-        # attacker.set_normalization_used(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])
-
+        
         if os.path.isfile(adv_dataset_pkl_path):
             self.adv_test_pkl, _ = torch.load(adv_dataset_pkl_path, weights_only=False).tensors
             return
@@ -790,9 +988,18 @@ class TAPTVLI(TrainerX):
         Run Test-time prompt Tuning
         """
         self.model.set_prompt_inits()   # Init with current prompts
+        unwrap_model(self.model).set_moe_aux_loss_scale(1.0)
+        train_tau = self.cfg.TRAINER.TAMEVLJ.TRAIN_TAU
+        train_base_prompt = self.cfg.TRAINER.TAMEVLJ.TRAIN_BASE_PROMPT
         for name, param in self.model.named_parameters():
             if not self.cfg.TAPT.COCOOP: # MaPLe and CoOp
-                if "prompt_learner" not in name and "VPT" not in name:
+                if (
+                    "prompt_learner" in name
+                    or "VPT" in name
+                    or is_trainable_moe_parameter(name, train_tau, train_base_prompt)
+                ):
+                    param.requires_grad_(True)
+                else:
                     param.requires_grad_(False)
             else:
                 if "text_encoder" not in name:
@@ -803,21 +1010,29 @@ class TAPTVLI(TrainerX):
             optimizer = None
             optim_state = None
         else:
-            # trainable_param = self.model.prompt_learner.parameters()
-            trainable_param = []
             for name, param in self.model.named_parameters():
                 if param.requires_grad:
                     print(name)
-                    trainable_param.append(param)
-            optimizer = torch.optim.AdamW(trainable_param, self.cfg.TAPT.LR)
+            param_groups = build_moe_param_groups(
+                self.model,
+                base_lr=self.cfg.TAPT.LR,
+                weight_decay=self.cfg.OPTIM.WEIGHT_DECAY,
+                lr_mult_gate=self.cfg.TRAINER.TAMEVLJ.LR_MULT_GATE,
+                lr_mult_scale=self.cfg.TRAINER.TAMEVLJ.LR_MULT_SCALE,
+            )
+            optimizer = torch.optim.AdamW(param_groups, lr=self.cfg.TAPT.LR, weight_decay=self.cfg.OPTIM.WEIGHT_DECAY)
             optim_state = deepcopy(optimizer.state_dict())
 
         # setup automatic mixed-precision (Amp) loss scaling
         scaler = torch.cuda.amp.GradScaler(init_scale=1000)
 
+        # for name, param in self.model.prompt_learner.named_parameters():
+        #     print(name)
+            
+        # print(self.model)
         # for name, parameters in self.model.named_parameters():
         #     print(name + " " + str(parameters.requires_grad))
-                    
+        
         print('=> Using native Torch AMP. Training in mixed precision.')
         print("number of test samples: {}".format(len(self.tapt_loader.dataset)))
         print("DATASET.TAPT: {}".format(self.cfg.DATASET.TAPT))
@@ -829,13 +1044,13 @@ class TAPTVLI(TrainerX):
         return results
 
     def test_time_adv_adapt_eval(self, val_loader, model, optimizer, optim_state, scaler, args):
-        batch_time = AverageMeter('Time', ':6.3f', Summary.NONE)
+        batch_time = AverageMeter_TAPT('Time', ':6.3f', Summary.NONE)
         if self.cfg.AT.ADVALIGN:
-            top1 = AverageMeter('Robust Acc@1', ':6.2f', Summary.AVERAGE)
-            top5 = AverageMeter('Robust Acc@5', ':6.2f', Summary.AVERAGE)
+            top1 = AverageMeter_TAPT('Robust Acc@1', ':6.2f', Summary.AVERAGE)
+            top5 = AverageMeter_TAPT('Robust Acc@5', ':6.2f', Summary.AVERAGE)
         else:
-            top1 = AverageMeter('Acc@1', ':6.2f', Summary.AVERAGE)
-            top5 = AverageMeter('Acc@5', ':6.2f', Summary.AVERAGE)
+            top1 = AverageMeter_TAPT('Acc@1', ':6.2f', Summary.AVERAGE)
+            top5 = AverageMeter_TAPT('Acc@5', ':6.2f', Summary.AVERAGE)
 
         progress = ProgressMeter(
             len(val_loader),
@@ -847,9 +1062,6 @@ class TAPTVLI(TrainerX):
 
         # reset model and switch to evaluate mode
         model.eval()
-
-        reset_counter = 0  # Initialize the counter
-
         if not args.COCOOP: # no need to reset cocoop because it's fixed
             with torch.no_grad():
                 model.reset()
@@ -879,15 +1091,9 @@ class TAPTVLI(TrainerX):
 
             # reset the tunable prompt to its initial state
             if not args.COCOOP: # no need to reset cocoop because it's fixed
-
-                # Increment the counter
-                reset_counter += 1
-
                 if args.TTA_STEPS > 0:
-                    if reset_counter % self.cfg.TAPT.RESET == 0:  # Reset every 4 iterations
-                        # print(reset_counter)
-                        with torch.no_grad():
-                            model.reset()
+                    with torch.no_grad():
+                        model.reset()
                 optimizer.load_state_dict(optim_state)
                 self.test_time_adv_tuning(model, images, optimizer, scaler, args)
             else:
@@ -927,14 +1133,22 @@ class TAPTVLI(TrainerX):
         return [top1.avg, top5.avg]
 
     def test_time_adv_tuning(self, model, inputs, optimizer, scaler, args):
+        if args.COCOOP:
+            image_feature, pgen_ctx = inputs
+            pgen_ctx.requires_grad = True
+            optimizer = torch.optim.AdamW([pgen_ctx], args.LR)
         
         selected_idx = None
         gamma = self.cfg.TAPT.GAMMA # 1 adv, 0 clean
+        base_model = unwrap_model(model)
 
         for j in range(args.TTA_STEPS):
             with torch.cuda.amp.autocast():
-
-                output = model(inputs) 
+                if args.COCOOP:
+                    output = model((image_feature, pgen_ctx))
+                else:
+                    output = model(inputs) 
+                loss = base_model.compute_moe_aux_loss()
 
                 if selected_idx is not None:
                     output = output[selected_idx]
@@ -942,7 +1156,7 @@ class TAPTVLI(TrainerX):
                     output, selected_idx = self.select_confident_samples(output, args.TAPT_THRESHOLD, args.ALIGN_THRESHOLD)
 
                 if args.TAPT_LOSS:
-                    loss = self.avg_entropy(output)
+                    loss = loss + self.avg_entropy(output)
 
                 # Only selected indexes
                 target_feat_distr = (self.visual_means, self.visual_vars)
@@ -964,7 +1178,17 @@ class TAPTVLI(TrainerX):
                     loss_tapt_clean = align_loss_func(out_feat_distr, target_clean_feat_distr)
 
                     distr_loss = DISTR_LOSS_W * (loss_tapt_adv * gamma + loss_tapt_clean * (1 - gamma))
-                    loss = distr_loss if not args.TAPT_LOSS else loss + distr_loss
+
+                    loss = loss + distr_loss
+
+                # if args.DISTR_ALIGN:
+                #     DISTR_LOSS_W = args.DISTR_LOSS_W / (args.ALIGN_LAYER_TO - args.ALIGN_LAYER_FROM)
+                #     if not args.TAPT_LOSS:
+                #         loss = DISTR_LOSS_W * self.distr_align_loss(out_feat_distr, target_feat_distr, 
+                #                                 layers_from=args.ALIGN_LAYER_FROM, layers_to=args.ALIGN_LAYER_TO)
+                #     else: 
+                #         loss += DISTR_LOSS_W * self.distr_align_loss(out_feat_distr, target_feat_distr, 
+                #                                 layers_from=args.ALIGN_LAYER_FROM, layers_to=args.ALIGN_LAYER_TO)
 
             optimizer.zero_grad()
             # compute gradient and do SGD step
@@ -972,6 +1196,8 @@ class TAPTVLI(TrainerX):
             # Unscales the gradients of optimizer's assigned params in-place
             scaler.step(optimizer)
             scaler.update()
+        if args.COCOOP:
+            return pgen_ctx
 
         return
 
@@ -1029,6 +1255,10 @@ class TAPTVLI(TrainerX):
                 distr_loss += F.kl_div(F.log_softmax(out_mean, dim=-1), F.softmax(targ_mean, dim=-1), reduction='batchmean') 
             elif align_type == 'js':
                 distr_loss += self.compute_js_div(out_mean, targ_mean)
+            # elif align_type == 'wasserstein':
+            #     distr_loss += torch.mean(torch.abs(out_mean - targ_mean)) + torch.mean(torch.abs(torch.sqrt(out_var) - torch.sqrt(targ_var)))
+            # elif align_type == 'cosine':
+            #     distr_loss += 1 - F.cosine_similarity(out_mean, targ_mean, dim=-1).mean()
             else:
                 raise ValueError(f"Invalid align_type: {align_type}")
 
@@ -1056,8 +1286,9 @@ class TAPTVLI(TrainerX):
         m = 0.5 * (p + q)
         return 0.5 * (F.kl_div(F.log_softmax(p, dim=-1), F.softmax(m, dim=-1), reduction='batchmean') + F.kl_div(F.log_softmax(q, dim=-1), F.softmax(m, dim=-1), reduction='batchmean'))
 
+
     @torch.no_grad()
-    def save_and_compute_means(self, split=None, save_path='./stats/vitb32/'):
+    def save_and_compute_means(self, split=None, save_path='./stats/TAME/vitb32/'):
         """
         Saving feature maps (i.e. tokens from transformer) and calculating mean in batches
         """
@@ -1104,13 +1335,15 @@ class TAPTVLI(TrainerX):
         # Extract model name from save_path (e.g., 'vitb16' from './stats/vitb16/')
         model_name = save_path.rstrip('/').split('/')[-1]
 
+        checkpoint_variant = getattr(self, "stats_variant", "adv")
+
         print(f"******Saving means embedding to {save_path}*********")
-        torch.save(mean_visual_feat, save_path + "VLI_means_{}_{}_clean.pt".format(model_name, split))
+        torch.save(mean_visual_feat, save_path + "TAME_VLJ_means_{}_{}_{}.pt".format(model_name, split, checkpoint_variant))
 
         self.save_and_compute_var(split, mean_visual_feat, data_loader, save_path)
 
     @torch.no_grad()
-    def save_and_compute_var(self, split=None, mean_visual_feat=None, data_loader=None, save_path='./stats/vitb32/'):
+    def save_and_compute_var(self, split=None, mean_visual_feat=None, data_loader=None, save_path='./stats/TAME/vitb32/'):
         """
         Saving feature maps (i.e. tokens from transformer) and calculating variance in batches
         """
@@ -1147,9 +1380,11 @@ class TAPTVLI(TrainerX):
 
         # Extract model name from save_path (e.g., 'vitb16' from './stats/vitb16/')
         model_name = save_path.rstrip('/').split('/')[-1]
+        
+        checkpoint_variant = getattr(self, "stats_variant", "adv")
 
         print(f"******Saving vars embedding to {save_path}*********")
-        torch.save(var_visual_feat, save_path + "VLI_vars_{}_{}_clean.pt".format(model_name, split))
+        torch.save(var_visual_feat, save_path + "TAME_VLJ_vars_{}_{}_{}.pt".format(model_name, split, checkpoint_variant))
 
         results = self.evaluator.evaluate()
         for k, v in results.items():

@@ -3,7 +3,7 @@ DATALOADER:
     BATCH_SIZE: 4
   TEST:
     BATCH_SIZE: 100
-  NUM_WORKERS: 8
+  NUM_WORKERS: 16
 
 INPUT:
   SIZE: (224, 224)
@@ -29,7 +29,7 @@ MODEL:
     NAME: "ViT-B/16"
 
 TRAINER:
-  VLPROMPTALIGN:
+  TAPTVLI:
     N_CTX_VISION: 2  # number of context vectors at the vision branch
     N_CTX_TEXT: 2  # number of context vectors at the language branch
     CTX_INIT: "a photo of a"

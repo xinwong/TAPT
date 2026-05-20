@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.Python
+.eggs/
+build/
+dist/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Test-Time outputs (large)
+output/
+output*/
+logs/
+
+# Stats (means/vars) computed by cal scripts — regenerate via scripts/<TAME*>/TAPT_TAME_*_cal.sh
+stats/
+
+# Auto-generated job dispatch artifacts
+generated_jobs/
+
+# Adversarial-test pickles produced by before_adv_test()
+*.pkl
+
+# Process / job state
+*.pid
+
+# pip typo cruft (e.g. `pip install pkg=10.1` left an empty file named "=10.1")
+=*
+
+# Local environment / secrets
+.env
+.env.*
+!.env.example

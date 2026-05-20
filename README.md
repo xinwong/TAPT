@@ -37,18 +37,43 @@ This project provides scripts for test-time tuning and evaluating various prompt
 
 ## Example Usage
 
-Here are examples of how to train and evaluate different Test-Time Adversarial Prompt Tuning using a ViT-B/16 backbone in a zero-shot setting:
+Here are examples of how to run the retained plain TAPT baselines and the new TAME variants with a ViT-B/16 backbone in a zero-shot setting:
 
-*   **TAPT-VLI (Test-Time Adversarial V-L Independent Prompt):**
+*   **TAPTVLI (plain TAPT V-L Independent Prompt):**
 
     ```bash
-    ./scripts/vlip/TAPT_VLI_0shots_step1_eps1.sh
+    ./scripts/VLI/TAPT_VLI_0shots_step1_eps1.sh
     ```
 
-*   **TAPT-VLJ (Test-Time Adversarial V-L Joint Prompt):**
+*   **TAMEVLI (alignment-aware expert V-L Independent Prompt):**
 
     ```bash
-    ./scripts/vljp/TAPT_VLJ_0shots_step1_eps1.sh
+    ./scripts/TAMEVLI/TAPT_TAME_VLI_0shots_auto.sh
+    ```
+
+*   **TAPTVLJ (plain TAPT V-L Joint Prompt):**
+
+    ```bash
+    ./scripts/VLJ/TAPT_VLJ_0shots_step1_eps1.sh
+    ```
+
+*   **TAMEVLJ (alignment-aware expert V-L Joint Prompt):**
+
+    ```bash
+    ./scripts/TAMEVLJ/TAPT_TAME_VLJ_0shots_auto.sh
+    ```
+
+*   **TAPTV (plain TAPT Vision Prompt):**
+
+    ```bash
+    ./scripts/V/TAPT_V_0shots_step1_eps1.sh
+    ```
+
+*   **TAMEV (alignment-aware expert Vision Prompt):**
+
+    ```bash
+    ./scripts/TAMEV/TAPT_TAME_V_0shots_auto.sh
+    ```
 
 # Acknowledgement
 

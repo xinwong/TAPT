@@ -29,13 +29,11 @@ MODEL:
     NAME: "ViT-B/16"
 
 TRAINER:
-  TAPTVLI:
-    N_CTX_VISION: 2  # number of context vectors at the vision branch
-    N_CTX_TEXT: 2  # number of context vectors at the language branch
+  TAPTV:
+    N_CTX_VISION: 2
     CTX_INIT: "a photo of a"
     PREC: "fp16"
-    PROMPT_DEPTH_VISION: 9 # Max 12, minimum 0, for 0 it will act as shallow MaPLe (J=1)
-    PROMPT_DEPTH_TEXT: 9  # Max 12, minimum 0, for 0 it will act as shallow MaPLe (J=1)
+    PROMPT_DEPTH_VISION: 9
 
 TAPT:
   LOADER: True
@@ -52,7 +50,7 @@ TAPT:
 
 AT:
   TEST:
-    EPS: 1
+    EPS: 4
     ALPHA: 1
     STEPS: 100
   ALIGN_TYPE: "l1"

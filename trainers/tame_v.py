@@ -39,8 +39,62 @@ from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 
 _tokenizer = _Tokenizer()
 
+from fvcore.nn import FlopCountAnalysis
+
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
+
+MOE_STATE_NAMES = ("expert_prompts", "gate", "tau", "alpha", "base_prompt")
+
+
+def is_moe_state_parameter(name):
+    return any(key in name for key in MOE_STATE_NAMES)
+
+
+def is_trainable_moe_parameter(name, train_tau=True, train_base_prompt=True):
+    if "tau" in name and not train_tau:
+        return False
+    if "base_prompt" in name and not train_base_prompt:
+        return False
+    return is_moe_state_parameter(name)
+
+
+def unwrap_model(model):
+    return model.module if isinstance(model, nn.DataParallel) else model
+
+
+def is_moe_gate_parameter(name):
+    return "gate.weight" in name or "gate.bias" in name
+
+
+def is_moe_scale_parameter(name):
+    return ("alpha" in name) or ("tau" in name)
+
+
+def build_moe_param_groups(model, base_lr, weight_decay, lr_mult_gate, lr_mult_scale):
+    prompt_params = []
+    gate_params = []
+    scale_params = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if is_moe_scale_parameter(name):
+            scale_params.append(param)
+        elif is_moe_gate_parameter(name):
+            gate_params.append(param)
+        else:
+            prompt_params.append(param)
+
+    param_groups = []
+    if prompt_params:
+        param_groups.append({"params": prompt_params, "lr": base_lr, "weight_decay": weight_decay})
+    if gate_params:
+        param_groups.append({"params": gate_params, "lr": base_lr * lr_mult_gate, "weight_decay": weight_decay})
+    if scale_params:
+        param_groups.append({"params": scale_params, "lr": base_lr * lr_mult_scale, "weight_decay": 0.0})
+
+    return param_groups
 
 class TransformDataset(Dataset):
     def __init__(self, dataset, transform=None):
@@ -57,6 +111,7 @@ class TransformDataset(Dataset):
         return image, label
 
 def load_clip_to_cpu(cfg):
+    moe_cfg = cfg.TRAINER.TAMEV
     backbone_name = cfg.MODEL.BACKBONE.NAME
     url = clip._MODELS[backbone_name]
     model_path = clip._download(url)
@@ -68,11 +123,20 @@ def load_clip_to_cpu(cfg):
 
     except RuntimeError:
         state_dict = torch.load(model_path, map_location="cpu")
-    design_details = {"trainer": 'IVLP',
-                      "vision_depth": cfg.TRAINER.TAPTVLI.PROMPT_DEPTH_VISION,
-                      "language_depth": cfg.TRAINER.TAPTVLI.PROMPT_DEPTH_TEXT,
-                      "vision_ctx": cfg.TRAINER.TAPTVLI.N_CTX_VISION,
-                      "language_ctx": cfg.TRAINER.TAPTVLI.N_CTX_TEXT}
+    design_details = {"trainer": 'TAME_V',
+                      "vision_depth": moe_cfg.PROMPT_DEPTH_VISION,
+                      "vision_ctx": moe_cfg.N_CTX_VISION,
+                      "language_depth": 0,
+                      "language_ctx": 0,
+                      "num_experts": moe_cfg.NUM_EXPERTS,
+                      "delta_scale_init": moe_cfg.DELTA_SCALE_INIT,
+                      "gate_mode": moe_cfg.GATE_MODE,
+                      "gate_hybrid_lambda": moe_cfg.GATE_HYBRID_LAMBDA,
+                      "alpha_min": moe_cfg.ALPHA_MIN,
+                      "alpha_max": moe_cfg.ALPHA_MAX,
+                      "tau_min": moe_cfg.TAU_MIN,
+                      "tau_max": moe_cfg.TAU_MAX}
+    assert moe_cfg.PROMPT_DEPTH_VISION >= 1, "For Vision Prompting, PROMPT_DEPTH_VISION should be >= 1"
     model = clip.build_model(state_dict or model.state_dict(), design_details)
 
     return model
@@ -100,204 +164,124 @@ class TextEncoder(nn.Module):
 
         return x
 
-
-class VLPromptLearner(nn.Module):
+class FixedEmbeddings():
     def __init__(self, cfg, classnames, clip_model):
-        super().__init__()
-        self.learned_cls = False  # Just copied, check if setting to True
-        n_cls = len(classnames)
-        # Make sure Language depth >= 1
-        assert cfg.TRAINER.TAPTVLI.PROMPT_DEPTH_TEXT >= 1, "In Independent VL prompting, Language prompt depth should be >=1" \
-                                                        "\nPlease use VPT trainer if you want to learn only vision " \
-                                                        "branch  "
-        n_ctx = cfg.TRAINER.TAPTVLI.N_CTX_TEXT
-        ctx_init = cfg.TRAINER.TAPTVLI.CTX_INIT
-        dtype = clip_model.dtype
-        ctx_dim = clip_model.ln_final.weight.shape[0]
-        vis_dim = clip_model.visual.output_dim
+        moe_cfg = cfg.TRAINER.TAMEV
         clip_imsize = clip_model.visual.input_resolution
         cfg_imsize = cfg.INPUT.SIZE[0]
         assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
 
-        if ctx_init and (n_ctx) <= 4:
-            # use given words to initialize context vectors
-            ctx_init = ctx_init.replace("_", " ")
-            n_ctx = n_ctx
-            prompt = clip.tokenize(ctx_init)
-            with torch.no_grad():
-                embedding = clip_model.token_embedding(prompt).type(dtype)
-            ctx_vectors = embedding[0, 1: 1 + n_ctx, :]
-            prompt_prefix = ctx_init
-        else:
-            # random initialization
-            ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
-            nn.init.normal_(ctx_vectors, std=0.02)
-            prompt_prefix = " ".join(["X"] * n_ctx)
-        print(f"Adversarial Independent V-L design")
-        print(f'Initial text context: "{prompt_prefix}"')
-        print(f"Number of context words (tokens) for Language prompting: {n_ctx}")
-        print(f"Number of context words (tokens) for Vision prompting: {cfg.TRAINER.TAPTVLI.N_CTX_VISION}")
-        self.ctx = nn.Parameter(ctx_vectors)
+        prompt_prefix = "a photo of a"
+        print('TAME-V design')
+        print(f'Initial context: "{prompt_prefix}"')
+        print(f"Number of context words (tokens) for TAME-V prompting: {moe_cfg.N_CTX_VISION}")
+        print(f"Using fixed hand crated prompts")
 
         classnames = [name.replace("_", " ") for name in classnames]
-        name_lens = [len(_tokenizer.encode(name)) for name in classnames]
         prompts = [prompt_prefix + " " + name + "." for name in classnames]
 
-        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])  # (n_cls, n_tkn)
+        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts])
         with torch.no_grad():
-            embedding = clip_model.token_embedding(tokenized_prompts).type(dtype)
+            text_features = clip_model.encode_text(tokenized_prompts)
 
-        # These token vectors will be saved when in save_model(),
-        # but they should be ignored in load_model() as we want to use
-        # those computed using the current class names
-        self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
-        self.register_buffer("token_suffix", embedding[:, 1 + n_ctx:, :])  # CLS, EOS
+        self.fixed_embeddings = text_features
 
-        self.n_cls = n_cls
-        self.n_ctx = n_ctx
-        self.tokenized_prompts = tokenized_prompts  # torch.Tensor
-        self.name_lens = name_lens
-
-
-    def construct_prompts(self, ctx, prefix, suffix, label=None):
-        # dim0 is either batch_size (during training) or n_cls (during testing)
-        # ctx: context tokens, with shape of (dim0, n_ctx, ctx_dim)
-        # prefix: the sos token, with shape of (n_cls, 1, ctx_dim)
-        # suffix: remaining tokens, with shape of (n_cls, *, ctx_dim)
-
-        if label is not None:
-            prefix = prefix[label]
-            suffix = suffix[label]
-
-        prompts = torch.cat(
-            [
-                prefix,  # (dim0, 1, dim)
-                ctx,  # (dim0, n_ctx, dim)
-                suffix,  # (dim0, *, dim)
-            ],
-            dim=1,
-        )
-
-        return prompts
-
-    def forward(self):
-        ctx = self.ctx
-        if ctx.dim() == 2:
-            ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
-
-        prefix = self.token_prefix
-        suffix = self.token_suffix
-        prompts = self.construct_prompts(ctx, prefix, suffix)
-
-        return prompts
+    def return_fixed_embeddings(self):
+        return self.fixed_embeddings
 
     def reset(self):
-        ctx_vectors = self.ctx_init_state
-        self.ctx.copy_(ctx_vectors) # to be optimized
-        if self.learned_cls:
-            cls_vectors = self.cls_init_state
-            self.cls.copy_(cls_vectors)
+
+        pass
 
     def reset_classnames(self, classnames, args):
-        print("==================================")
-        print(args)
-        self.device = self.ctx.device
-        self.n_cls = len(classnames)
-        if not self.learned_cls:
-            classnames = [name.replace("_", " ") for name in classnames]
-            name_lens = [len(_tokenizer.encode(name)) for name in classnames]
-            prompts = [self.prompt_prefix + " " + name + "." for name in classnames]
-        else:
-            cls_vectors = torch.empty(self.n_cls, 1, self.ctx_dim, dtype=self.dtype) # assume each learnable cls_token is only 1 word
-            nn.init.normal_(cls_vectors, std=0.02)
-            cls_token = "X"
-            name_lens = [1 for _ in classnames]
-            prompts = [self.prompt_prefix + " " + cls_token + "." for _ in classnames]
-            # TODO: re-init the cls parameters
-            # self.cls = nn.Parameter(cls_vectors) # to be optimized
-            self.cls_init_state = cls_vectors.detach().clone()
-        tokenized_prompts = torch.cat([tokenize(p) for p in prompts]).to(self.device)
 
-        clip = load_clip_to_cpu(args).to(self.device)
-
-        with torch.no_grad():
-            embedding = clip.token_embedding(tokenized_prompts).type(self.dtype)
-
-        self.token_prefix = embedding[:, :1, :]
-        self.token_suffix = embedding[:, 1 + self.n_ctx :, :]  # CLS, EOS
-
-        self.name_lens = name_lens
-        self.tokenized_prompts = tokenized_prompts
-        self.classnames = classnames
+        pass
 
     def set_prompt_init_states(self):
-        '''
-        Store the initial prompts
-        '''
-        ctx_vectors = self.ctx.detach().clone()
-        self.ctx_init_state = ctx_vectors
 
+        pass
 
 class CustomCLIP(nn.Module):
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
-        self.prompt_learner = VLPromptLearner(cfg, classnames, clip_model)
-        self.tokenized_prompts = self.prompt_learner.tokenized_prompts
+        self.cfg = cfg
+        self.moe_cfg = cfg.TRAINER.TAMEV
+        self.embeddings = FixedEmbeddings(cfg, classnames, clip_model)
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoder(clip_model)
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
+        self.moe_aux_loss_scale = 1.0
         self.vpt_initial_states = {}
         for name, param in self.named_parameters():
             if "VPT" in name:
                 self.vpt_initial_states[name] = param.detach().clone()
-                
+        self.moe_initial_states = {}
+        for name, param in self.named_parameters():
+            if is_moe_state_parameter(name):
+                self.moe_initial_states[name] = param.detach().clone()
+
         self.normalize = transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])
 
-    def forward(self, image, label=None):
+    def forward(self, image, label=None, training=False):
         image = self.normalize(image)
 
-        tokenized_prompts = self.tokenized_prompts
         logit_scale = self.logit_scale.exp()
 
-        prompts = self.prompt_learner()
-        text_features = self.text_encoder(prompts, tokenized_prompts)
+        text_features = self.embeddings.return_fixed_embeddings().to(image.device)
         image_features = self.image_encoder(image.type(self.dtype))
 
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         logits = logit_scale * image_features @ text_features.t()
 
-        if self.prompt_learner.training:
-            return F.cross_entropy(logits, label)
+        if training or (label is not None and self.training):
+            return F.cross_entropy(logits, label) + self.compute_moe_aux_loss()
 
         return logits
 
+    def compute_moe_aux_loss(self):
+        total_balance = self.logit_scale.new_tensor(0.0)
+        total_diversity = self.logit_scale.new_tensor(0.0)
+        transformer = self.image_encoder.transformer
+        if hasattr(transformer, "moe_aux_losses"):
+            total_balance, total_diversity = transformer.moe_aux_losses()
+        balance_w = getattr(self.moe_cfg, "AUX_BALANCE_W_TARGET", self.moe_cfg.AUX_BALANCE_W)
+        diversity_w = getattr(self.moe_cfg, "AUX_DIVERSITY_W_TARGET", self.moe_cfg.AUX_DIVERSITY_W)
+        return self.moe_aux_loss_scale * (balance_w * total_balance + diversity_w * total_diversity)
+
+    def set_moe_aux_loss_scale(self, scale):
+        self.moe_aux_loss_scale = float(scale)
+
     def get_text_features(self):
         with torch.no_grad():
-            tokenized_prompts = self.tokenized_prompts
-
-            prompts = self.prompt_learner()
-            text_features = self.text_encoder(prompts, tokenized_prompts)
+            text_features = self.embeddings.return_fixed_embeddings().to(self.logit_scale.device)
             text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         return text_features
-    
+
     # restore the initial state of the prompt_learner (tunable prompt)
     def reset(self):
-        self.prompt_learner.reset()
+        # self.prompt_learner.reset()
         for name, param in self.named_parameters():
             if "VPT" in name:
                 # print(name)
                 param.copy_(self.vpt_initial_states[name])
-
+            # 恢复 MoE 相关参数
+            if is_moe_state_parameter(name):
+                if name in self.moe_initial_states:
+                    param.copy_(self.moe_initial_states[name])
+                
     def reset_classnames(self, classnames, arch):
-        self.prompt_learner.reset_classnames(classnames, arch)
-        self.tokenized_prompts = self.prompt_learner.tokenized_prompts
+        # self.prompt_learner.reset_classnames(classnames, arch)
+        # self.tokenized_prompts = self.prompt_learner.tokenized_prompts
+        pass
 
     def set_prompt_inits(self):
-        print("Re-updating prompt initializations to current prompts.")
-        self.prompt_learner.set_prompt_init_states()
-
+        for name, param in self.named_parameters():
+            if "VPT" in name:
+                self.vpt_initial_states[name] = param.detach().clone()
+            if is_moe_state_parameter(name):
+                self.moe_initial_states[name] = param.detach().clone()
 
 def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
@@ -306,6 +290,10 @@ def _get_clones(module, N):
 ID_to_DIRNAME={
     'PUG': 'PUG_ImageNet',
     'I': 'imagenet/images',
+    'A': 'imagenet-adversarial/imagenet-a',
+    'K': 'imagenet-sketch/images',
+    'R': 'imagenet-rendition/imagenet-r',
+    'V': 'imagenetv2/imagenetv2-matched-frequency-format-val',
     'flower102': 'oxford_flowers',
     'dtd': 'dtd',
     'pets': 'oxford_pets',
@@ -484,9 +472,13 @@ class AdvAugMixAugmenter(object):
         return [image] + views
 
 
-
-@TRAINER_REGISTRY.register()
-class TAPTVLI(TrainerX):
+class TAMEVBase(TrainerX):
+    def build_pug_dataset(self, set_id, data_root, transform):
+        setting = set_id.split('_')[1]
+        pug_dir = pug_setting_dir[setting]
+        testdir = os.path.join(data_root, ID_to_DIRNAME['PUG'], pug_dir)
+        testset = datasets.ImageFolder(testdir, transform=transform)
+        return testset
 
     def build_fewshot_dataset(self, set_id, root, transform, mode='train', n_shot=None):
         if set_id.lower() == 'aircraft':
@@ -509,6 +501,8 @@ class TAPTVLI(TrainerX):
                 testset = self.build_fewshot_dataset(set_id, os.path.join(data_root, ID_to_DIRNAME[set_id.lower()]), transform, mode=mode, n_shot=n_shot)
             else:
                 testset = self.build_fewshot_dataset(set_id, os.path.join(data_root, ID_to_DIRNAME[set_id.lower()]), transform, mode=mode)
+        elif 'PUG' in set_id:
+            testset = self.build_pug_dataset(set_id, data_root, transform=transform)
         else:
             raise NotImplementedError
             
@@ -516,6 +510,9 @@ class TAPTVLI(TrainerX):
 
     def build_data_loader(self):
         super().build_data_loader()
+        if not self.cfg.TAPT.LOADER:
+            self.tapt_loader = None
+            return
         print("Test-Time Adversarial Loader: ", self.cfg.AT.ADVALIGN)
         if self.cfg.AT.ADVALIGN:
             self.tapt_loader = self.get_tapt_adv_dataloader(self.cfg.TAPT)
@@ -595,17 +592,33 @@ class TAPTVLI(TrainerX):
 
 
     def check_cfg(self, cfg):
-        assert cfg.TRAINER.TAPTVLI.PREC in ["fp16", "fp32", "amp"]
+        assert cfg.TRAINER.TAMEV.PREC in ["fp16", "fp32", "amp"]
+
+    def get_moe_aux_loss_scale(self):
+        moe_cfg = self.cfg.TRAINER.TAMEV
+        warmup_epochs = max(int(getattr(moe_cfg, "AUX_WARMUP_EPOCHS", 1)), 1)
+        current_epoch = getattr(self, "epoch", 0) + 1
+        return min(1.0, current_epoch / warmup_epochs)
+
+    def build_moe_optimizer(self, base_lr):
+        moe_cfg = self.cfg.TRAINER.TAMEV
+        param_groups = build_moe_param_groups(
+            self.model,
+            base_lr=base_lr,
+            weight_decay=self.cfg.OPTIM.WEIGHT_DECAY,
+            lr_mult_gate=moe_cfg.LR_MULT_GATE,
+            lr_mult_scale=moe_cfg.LR_MULT_SCALE,
+        )
+        return build_optimizer(self.model, self.cfg.OPTIM, param_groups=param_groups)
 
     def build_model(self):
         cfg = self.cfg
         classnames = self.dm.dataset.classnames
 
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
-
         clip_model = load_clip_to_cpu(cfg)
 
-        if cfg.TRAINER.TAPTVLI.PREC == "fp32" or cfg.TRAINER.TAPTVLI.PREC == "amp":
+        if cfg.TRAINER.TAMEV.PREC == "fp32" or cfg.TRAINER.TAMEV.PREC == "amp":
             # CLIP's default precision is fp16
             clip_model.float()
 
@@ -614,11 +627,13 @@ class TAPTVLI(TrainerX):
 
         print("Turning off gradients in both the image and the text encoder")
         name_to_update = "prompt_learner"
+        train_tau = cfg.TRAINER.TAMEV.TRAIN_TAU
+        train_base_prompt = cfg.TRAINER.TAMEV.TRAIN_BASE_PROMPT
 
         for name, param in self.model.named_parameters():
             if name_to_update not in name:
                 # Make sure that VPT prompts are updated
-                if "VPT" in name:
+                if "VPT" in name or is_trainable_moe_parameter(name, train_tau, train_base_prompt):
                     param.requires_grad_(True)
                 else:
                     param.requires_grad_(False)
@@ -634,12 +649,11 @@ class TAPTVLI(TrainerX):
             load_pretrained_weights(self.model, cfg.MODEL.INIT_WEIGHTS)
 
         self.model.to(self.device)
-        # NOTE: only give prompt_learner to the optimizer
-        self.optim = build_optimizer(self.model, cfg.OPTIM)
+        self.optim = self.build_moe_optimizer(cfg.OPTIM.LR)
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
-        self.register_model("VLPromptLearner", self.model, self.optim, self.sched)
+        self.register_model("prompt_learner", self.model, self.optim, self.sched)
 
-        self.scaler = GradScaler() if cfg.TRAINER.TAPTVLI.PREC == "amp" else None
+        self.scaler = GradScaler() if cfg.TRAINER.TAMEV.PREC == "amp" else None
 
         # Note that multi-gpu training could be slow because CLIP's size is
         # big, which slows down the copy operation in DataParallel
@@ -654,8 +668,9 @@ class TAPTVLI(TrainerX):
         model = self.model
         optim = self.optim
         scaler = self.scaler
+        unwrap_model(model).set_moe_aux_loss_scale(self.get_moe_aux_loss_scale())
 
-        prec = self.cfg.TRAINER.TAPTVLI.PREC
+        prec = self.cfg.TRAINER.TAMEV.PREC
         if prec == "amp":
             with autocast():
                 loss = model(image, label)
@@ -717,6 +732,9 @@ class TAPTVLI(TrainerX):
             # set strict=False
             self._models[name].load_state_dict(state_dict, strict=False)
 
+
+@TRAINER_REGISTRY.register()
+class TAMEV(TAMEVBase):
     def before_adv_align(self):
         r"""
         Arguments:
@@ -732,11 +750,12 @@ class TAPTVLI(TrainerX):
         # If inputs were normalized, then
         # attacker.set_normalization_used(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])
 
+        # save_path = "/cpfs01/projects-HDD/cfff-12667fb5c6f8_HDD/wx_22110240041/wangxin/Test-Prompt/multimodal-prompt-learning/output/evaluation/AdvMaPLe/vit_b16_c2_ep100_batch32_2ctx_9depth_cross_datasets_lr0.0035_16shots/oxford_pets/seed1/100/OxfordPets_adv.pkl"
         if os.path.isfile(adv_dataset_pkl_path):
             self.adv_test_pkl, _ = torch.load(adv_dataset_pkl_path, weights_only=False).tensors
             return
         else:
-            raise FileNotFoundError('Adv dataset not found at "{}"'.format(adv_dataset_pkl_path))
+            raise
 
 
     def get_tapt_adv_dataloader(self, args):
@@ -790,34 +809,48 @@ class TAPTVLI(TrainerX):
         Run Test-time prompt Tuning
         """
         self.model.set_prompt_inits()   # Init with current prompts
+        unwrap_model(self.model).set_moe_aux_loss_scale(1.0)
+        train_tau = self.cfg.TRAINER.TAMEV.TRAIN_TAU
+        train_base_prompt = self.cfg.TRAINER.TAMEV.TRAIN_BASE_PROMPT
         for name, param in self.model.named_parameters():
             if not self.cfg.TAPT.COCOOP: # MaPLe and CoOp
-                if "prompt_learner" not in name and "VPT" not in name:
+                if (
+                    "prompt_learner" in name
+                    or "VPT" in name
+                    or is_trainable_moe_parameter(name, train_tau, train_base_prompt)
+                ):
+                    param.requires_grad_(True)
+                else:
                     param.requires_grad_(False)
             else:
                 if "text_encoder" not in name:
                     param.requires_grad_(False)
-
+            
         # define optimizer
         if self.cfg.TAPT.COCOOP:
             optimizer = None
             optim_state = None
         else:
-            # trainable_param = self.model.prompt_learner.parameters()
-            trainable_param = []
             for name, param in self.model.named_parameters():
                 if param.requires_grad:
                     print(name)
-                    trainable_param.append(param)
-            optimizer = torch.optim.AdamW(trainable_param, self.cfg.TAPT.LR)
+            param_groups = build_moe_param_groups(
+                self.model,
+                base_lr=self.cfg.TAPT.LR,
+                weight_decay=self.cfg.OPTIM.WEIGHT_DECAY,
+                lr_mult_gate=self.cfg.TRAINER.TAMEV.LR_MULT_GATE,
+                lr_mult_scale=self.cfg.TRAINER.TAMEV.LR_MULT_SCALE,
+            )
+            optimizer = torch.optim.AdamW(param_groups, lr=self.cfg.TAPT.LR, weight_decay=self.cfg.OPTIM.WEIGHT_DECAY)
             optim_state = deepcopy(optimizer.state_dict())
 
         # setup automatic mixed-precision (Amp) loss scaling
         scaler = torch.cuda.amp.GradScaler(init_scale=1000)
 
+        # print(self.model)
         # for name, parameters in self.model.named_parameters():
         #     print(name + " " + str(parameters.requires_grad))
-                    
+
         print('=> Using native Torch AMP. Training in mixed precision.')
         print("number of test samples: {}".format(len(self.tapt_loader.dataset)))
         print("DATASET.TAPT: {}".format(self.cfg.DATASET.TAPT))
@@ -847,9 +880,6 @@ class TAPTVLI(TrainerX):
 
         # reset model and switch to evaluate mode
         model.eval()
-
-        reset_counter = 0  # Initialize the counter
-
         if not args.COCOOP: # no need to reset cocoop because it's fixed
             with torch.no_grad():
                 model.reset()
@@ -879,15 +909,9 @@ class TAPTVLI(TrainerX):
 
             # reset the tunable prompt to its initial state
             if not args.COCOOP: # no need to reset cocoop because it's fixed
-
-                # Increment the counter
-                reset_counter += 1
-
                 if args.TTA_STEPS > 0:
-                    if reset_counter % self.cfg.TAPT.RESET == 0:  # Reset every 4 iterations
-                        # print(reset_counter)
-                        with torch.no_grad():
-                            model.reset()
+                    with torch.no_grad():
+                        model.reset()
                 optimizer.load_state_dict(optim_state)
                 self.test_time_adv_tuning(model, images, optimizer, scaler, args)
             else:
@@ -927,14 +951,22 @@ class TAPTVLI(TrainerX):
         return [top1.avg, top5.avg]
 
     def test_time_adv_tuning(self, model, inputs, optimizer, scaler, args):
+        if args.COCOOP:
+            image_feature, pgen_ctx = inputs
+            pgen_ctx.requires_grad = True
+            optimizer = torch.optim.AdamW([pgen_ctx], args.LR)
         
         selected_idx = None
-        gamma = self.cfg.TAPT.GAMMA # 1 adv, 0 clean
+        gamma = 0.5 # 1 adv, 0 clea
+        base_model = unwrap_model(model)
 
         for j in range(args.TTA_STEPS):
             with torch.cuda.amp.autocast():
-
-                output = model(inputs) 
+                if args.COCOOP:
+                    output = model((image_feature, pgen_ctx))
+                else:
+                    output = model(inputs) 
+                loss = base_model.compute_moe_aux_loss()
 
                 if selected_idx is not None:
                     output = output[selected_idx]
@@ -942,7 +974,7 @@ class TAPTVLI(TrainerX):
                     output, selected_idx = self.select_confident_samples(output, args.TAPT_THRESHOLD, args.ALIGN_THRESHOLD)
 
                 if args.TAPT_LOSS:
-                    loss = self.avg_entropy(output)
+                    loss = loss + self.avg_entropy(output)
 
                 # Only selected indexes
                 target_feat_distr = (self.visual_means, self.visual_vars)
@@ -964,7 +996,17 @@ class TAPTVLI(TrainerX):
                     loss_tapt_clean = align_loss_func(out_feat_distr, target_clean_feat_distr)
 
                     distr_loss = DISTR_LOSS_W * (loss_tapt_adv * gamma + loss_tapt_clean * (1 - gamma))
-                    loss = distr_loss if not args.TAPT_LOSS else loss + distr_loss
+
+                    loss = loss + distr_loss
+
+                # if args.DISTR_ALIGN:
+                #     DISTR_LOSS_W = args.DISTR_LOSS_W / (args.ALIGN_LAYER_TO - args.ALIGN_LAYER_FROM)
+                #     if not args.TAPT_LOSS:
+                #         loss = DISTR_LOSS_W * self.distr_align_loss(out_feat_distr, target_feat_distr, 
+                #                                 layers_from=args.ALIGN_LAYER_FROM, layers_to=args.ALIGN_LAYER_TO)
+                #     else: 
+                #         loss += DISTR_LOSS_W * self.distr_align_loss(out_feat_distr, target_feat_distr, 
+                #                                 layers_from=args.ALIGN_LAYER_FROM, layers_to=args.ALIGN_LAYER_TO)
 
             optimizer.zero_grad()
             # compute gradient and do SGD step
@@ -972,6 +1014,8 @@ class TAPTVLI(TrainerX):
             # Unscales the gradients of optimizer's assigned params in-place
             scaler.step(optimizer)
             scaler.update()
+        if args.COCOOP:
+            return pgen_ctx
 
         return
 
@@ -1029,6 +1073,10 @@ class TAPTVLI(TrainerX):
                 distr_loss += F.kl_div(F.log_softmax(out_mean, dim=-1), F.softmax(targ_mean, dim=-1), reduction='batchmean') 
             elif align_type == 'js':
                 distr_loss += self.compute_js_div(out_mean, targ_mean)
+            # elif align_type == 'wasserstein':
+            #     distr_loss += torch.mean(torch.abs(out_mean - targ_mean)) + torch.mean(torch.abs(torch.sqrt(out_var) - torch.sqrt(targ_var)))
+            # elif align_type == 'cosine':
+            #     distr_loss += 1 - F.cosine_similarity(out_mean, targ_mean, dim=-1).mean()
             else:
                 raise ValueError(f"Invalid align_type: {align_type}")
 
@@ -1056,8 +1104,9 @@ class TAPTVLI(TrainerX):
         m = 0.5 * (p + q)
         return 0.5 * (F.kl_div(F.log_softmax(p, dim=-1), F.softmax(m, dim=-1), reduction='batchmean') + F.kl_div(F.log_softmax(q, dim=-1), F.softmax(m, dim=-1), reduction='batchmean'))
 
+
     @torch.no_grad()
-    def save_and_compute_means(self, split=None, save_path='./stats/vitb32/'):
+    def save_and_compute_means(self, split=None, save_path='./stats/TAME/vitb32/'):
         """
         Saving feature maps (i.e. tokens from transformer) and calculating mean in batches
         """
@@ -1104,13 +1153,15 @@ class TAPTVLI(TrainerX):
         # Extract model name from save_path (e.g., 'vitb16' from './stats/vitb16/')
         model_name = save_path.rstrip('/').split('/')[-1]
 
+        checkpoint_variant = getattr(self, "stats_variant", "adv")
+
         print(f"******Saving means embedding to {save_path}*********")
-        torch.save(mean_visual_feat, save_path + "VLI_means_{}_{}_clean.pt".format(model_name, split))
+        torch.save(mean_visual_feat, save_path + "TAME_V_means_{}_{}_{}.pt".format(model_name, split, checkpoint_variant))
 
         self.save_and_compute_var(split, mean_visual_feat, data_loader, save_path)
 
     @torch.no_grad()
-    def save_and_compute_var(self, split=None, mean_visual_feat=None, data_loader=None, save_path='./stats/vitb32/'):
+    def save_and_compute_var(self, split=None, mean_visual_feat=None, data_loader=None, save_path='./stats/TAME/vitb32/'):
         """
         Saving feature maps (i.e. tokens from transformer) and calculating variance in batches
         """
@@ -1148,8 +1199,10 @@ class TAPTVLI(TrainerX):
         # Extract model name from save_path (e.g., 'vitb16' from './stats/vitb16/')
         model_name = save_path.rstrip('/').split('/')[-1]
 
+        checkpoint_variant = getattr(self, "stats_variant", "adv")
+
         print(f"******Saving vars embedding to {save_path}*********")
-        torch.save(var_visual_feat, save_path + "VLI_vars_{}_{}_clean.pt".format(model_name, split))
+        torch.save(var_visual_feat, save_path + "TAME_V_vars_{}_{}_{}.pt".format(model_name, split, checkpoint_variant))
 
         results = self.evaluator.evaluate()
         for k, v in results.items():

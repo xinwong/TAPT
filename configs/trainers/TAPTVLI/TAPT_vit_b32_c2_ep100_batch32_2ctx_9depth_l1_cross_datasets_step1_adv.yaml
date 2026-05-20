@@ -26,7 +26,7 @@ TRAIN:
 
 MODEL:
   BACKBONE:
-    NAME: "ViT-B/16"
+    NAME: "ViT-B/32"
 
 TRAINER:
   TAPTVLI:
@@ -56,5 +56,4 @@ AT:
     ALPHA: 1
     STEPS: 100
   ALIGN_TYPE: "l1"
-  ADVALIGN: False
-  
+  ADVALIGN: True

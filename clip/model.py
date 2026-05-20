@@ -1,5 +1,6 @@
 from collections import OrderedDict
 from typing import Tuple, Union
+import math
 
 import numpy as np
 import torch
@@ -163,6 +164,11 @@ class QuickGELU(nn.Module):
         return x * torch.sigmoid(1.702 * x)
 
 
+def _inverse_softplus(value: float) -> float:
+    value = max(float(value), 1e-6)
+    return math.log(math.expm1(value))
+
+
 class ResidualAttentionBlock(nn.Module):
     def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None):
         super().__init__()
@@ -258,6 +264,279 @@ class ResidualAttentionBlock_IVLP(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
 
+class ResidualAttentionBlock_IVLP_MoE(nn.Module):
+    """
+    A Residual Attention Block modified to incorporate Mixture-of-Experts (MoE)
+    for multiple learnable deep prompts (3 experts in this case).
+    """
+    def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None, add_prompt=False,
+                 text_layer=False, i=0, design_details=None):
+        super().__init__()
+
+        self.attn = nn.MultiheadAttention(d_model, n_head)
+        self.ln_1 = LayerNorm(d_model)
+        self.mlp = nn.Sequential(OrderedDict([
+            ("c_fc", nn.Linear(d_model, d_model * 4)),
+            ("gelu", QuickGELU()),
+            ("c_proj", nn.Linear(d_model * 4, d_model))
+        ]))
+        self.ln_2 = LayerNorm(d_model)
+        # Only add learnable tokens if flag is set True
+        # For the first iteration i, we should not add the learnable parameters
+        # as it is already been taken care of in the very start, for both text
+        # and the visual branch
+        self.text_layer = text_layer
+        self.attn_mask = attn_mask
+
+        # --- MoE Prompt Specific Initialization ---
+        self.num_experts = design_details["num_experts"]  
+        self.n_ctx_text = 0
+        self.n_ctx_visual = 0
+
+        if i != 0:
+            self.add_prompt = add_prompt
+            if self.add_prompt:
+                if self.text_layer:
+                    self.n_ctx_text = design_details["language_ctx"]  # hyperparameter
+                    expert_prompts_tensor = torch.empty(self.num_experts, self.n_ctx_text, d_model)
+                else:
+                    self.n_ctx_visual = design_details["vision_ctx"]  # hyperparameter
+                    expert_prompts_tensor = torch.empty(self.num_experts, self.n_ctx_visual, d_model)
+                # Code snippet for per layer visual prompts
+                nn.init.normal_(expert_prompts_tensor, std=0.02)
+                self.expert_prompts = nn.Parameter(expert_prompts_tensor) # 形状: (E, C, D)
+                self.gate = nn.Linear(d_model, self.num_experts)
+        else:
+            # 此层不添加提示（i=0或add_prompt=False）
+            self.add_prompt = False # 如果i == 0，确保它为false
+
+    def attention(self, x: torch.Tensor):
+        self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
+        return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
+
+    def forward(self, x: torch.Tensor):
+        # Will need to append the learnable tokens for this layer here
+        # Check if flag was set for this layer or not
+        orig_dtype = x.dtype  # 保存原始数据类型
+        
+        if self.add_prompt:
+            # Also see if this is textual transformer layer or not
+            if not self.text_layer:
+                # 视觉层的MoE提示处理
+                # prefix 维度: [L, B, D]  (不含上层 prompt)
+                prefix = x[0:x.shape[0] - self.n_ctx_visual, :, :]
+                
+                ## Token-wise logits: 每个 token 分别计算专家 logits，再沿 token 维求平均
+                gate_input = prefix.permute(1, 0, 2)                                 # [B, L, D]
+                gate_logits = self.gate(gate_input)                                  # [B, L, num_experts]
+                gate_weights = F.softmax(gate_logits, dim=-1)                        # [B, L, num_experts]
+                gate_weights = gate_weights.mean(dim=1)                              # [B, num_experts]
+                
+                # expert_prompts: [E, C, D] → 扩展 batch 维度
+                expert_prompts = self.expert_prompts.to(orig_dtype)                 # [E, C, D]
+                expert_prompts = expert_prompts.unsqueeze(0)                        # [1, E, C, D]
+                gate_weights = gate_weights.unsqueeze(-1).unsqueeze(-1)             # [B, E, 1, 1]
+                combined_prompts = (gate_weights * expert_prompts).sum(dim=1)       # [B, C, D]
+                
+                # 重新排列成 [C, B, D] 以便与 prefix 进行 concat
+                visual_context = combined_prompts.permute(1, 0, 2)                  # [C, B, D]
+                
+                # 连接原始输入和新的 prompt
+                x = torch.cat([prefix, visual_context], dim=0)
+            else:
+                # 文本层的 MoE 提示处理
+                prefix = x[:1, :, :]                                             # CLS token
+                suffix = x[1 + self.n_ctx_text:, :, :]                           # 其余 token
+                
+                ## Token-wise logits
+                all_tokens = torch.cat([prefix, suffix], dim=0)                   # [L, B, D]
+                gate_input = all_tokens.permute(1, 0, 2)                          # [B, L, D]
+                gate_logits = self.gate(gate_input)                               # [B, L, num_experts]
+                gate_weights = F.softmax(gate_logits, dim=-1)                     # [B, L, num_experts]
+                gate_weights = gate_weights.mean(dim=1)                           # [B, num_experts]
+
+                expert_prompts = self.expert_prompts.to(orig_dtype)              # [E, C, D]
+                expert_prompts = expert_prompts.unsqueeze(0)                     # [1, E, C, D]
+                gate_weights = gate_weights.unsqueeze(-1).unsqueeze(-1)          # [B, E, 1, 1]
+                combined_prompts = (gate_weights * expert_prompts).sum(dim=1)    # [B, C, D]
+
+                textual_context = combined_prompts.permute(1, 0, 2)              # [C, B, D]
+                
+                x = torch.cat([prefix, textual_context, suffix], dim=0)
+
+        # # Store feature in forward pass for alignment loss
+        if not self.text_layer:
+            self.visual_feat = x
+
+        # 正常的Transformer层计算
+        x = x + self.attention(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
+        return x
+
+
+class ResidualAttentionBlock_IVLP_MoE_Aware(nn.Module):
+    """
+    Alignment-Aware Soft MoE for IVLP/VPT.
+    Key improvements over IVLP_MoE:
+      1. Configurable CLS/token-mean/hybrid gating on normalized features
+      2. Anchored prompt = base_prompt + alpha * (mixed_prompt - base_prompt)
+      3. Bounded alpha/tau to stabilize optimization
+      4. expert_diversity_loss() preventing expert collapse
+      5. load_balance_loss() for balanced routing
+    """
+    def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None, add_prompt=False,
+                 text_layer=False, i=0, design_details=None):
+        super().__init__()
+
+        self.attn = nn.MultiheadAttention(d_model, n_head)
+        self.ln_1 = LayerNorm(d_model)
+        self.mlp = nn.Sequential(OrderedDict([
+            ("c_fc", nn.Linear(d_model, d_model * 4)),
+            ("gelu", QuickGELU()),
+            ("c_proj", nn.Linear(d_model * 4, d_model))
+        ]))
+        self.ln_2 = LayerNorm(d_model)
+        self.text_layer = text_layer
+        self.attn_mask = attn_mask
+
+        self.num_experts = design_details["num_experts"]
+        self.delta_scale_init = design_details.get("delta_scale_init", 0.1)
+        self.gate_mode = design_details.get("gate_mode", "hybrid")
+        self.gate_hybrid_lambda = design_details.get("gate_hybrid_lambda", 0.7)
+        self.alpha_min = design_details.get("alpha_min", 0.0)
+        self.alpha_max = design_details.get("alpha_max", 2.0)
+        self.tau_min = design_details.get("tau_min", 0.3)
+        self.tau_max = design_details.get("tau_max", 3.0)
+        self.n_ctx_text = 0
+        self.n_ctx_visual = 0
+        self._last_gate_weights = None
+
+        if self.gate_mode not in {"cls", "token_mean", "hybrid"}:
+            raise ValueError(f"Unsupported gate mode: {self.gate_mode}")
+
+        if i != 0:
+            self.add_prompt = add_prompt
+            if self.add_prompt:
+                if self.text_layer:
+                    self.n_ctx_text = design_details["language_ctx"]
+                    expert_prompts_tensor = torch.empty(self.num_experts, self.n_ctx_text, d_model)
+                else:
+                    self.n_ctx_visual = design_details["vision_ctx"]
+                    expert_prompts_tensor = torch.empty(self.num_experts, self.n_ctx_visual, d_model)
+                nn.init.normal_(expert_prompts_tensor, std=0.02)
+                base_prompt_tensor = expert_prompts_tensor.mean(dim=0).clone()
+                self.base_prompt = nn.Parameter(base_prompt_tensor)         # [C, D]
+                self.expert_prompts = nn.Parameter(expert_prompts_tensor)   # [E, C, D]
+                self.gate = nn.Linear(d_model, self.num_experts)
+                tau_init = min(max(1.0, self.tau_min), self.tau_max)
+                alpha_init = min(max(self.delta_scale_init, max(self.alpha_min, 1e-6)), self.alpha_max)
+                self.tau = nn.Parameter(torch.full((1,), _inverse_softplus(tau_init)))
+                self.alpha = nn.Parameter(torch.full((1,), _inverse_softplus(alpha_init)))
+        else:
+            self.add_prompt = False
+
+    def attention(self, x: torch.Tensor):
+        self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
+        return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
+
+    def _zero_loss(self):
+        return self.ln_1.weight.new_tensor(0.0)
+
+    def _bounded_scale(self, value: torch.Tensor, min_value: float, max_value: float):
+        scale = F.softplus(value.float())
+        if min_value is not None:
+            scale = scale.clamp(min=min_value)
+        if max_value is not None:
+            scale = scale.clamp(max=max_value)
+        return scale
+
+    def _router_logits(self, gate_source: torch.Tensor):
+        tokens = self.ln_1(gate_source)
+        cls_logits = self.gate(tokens[0])
+        if self.gate_mode == "cls":
+            return cls_logits
+
+        token_mean_logits = self.gate(tokens.mean(dim=0))
+        if self.gate_mode == "token_mean":
+            return token_mean_logits
+
+        lambda_cls = max(0.0, min(1.0, float(self.gate_hybrid_lambda)))
+        return lambda_cls * cls_logits + (1.0 - lambda_cls) * token_mean_logits
+
+    def _mix_expert_prompt(self, gate_source: torch.Tensor, orig_dtype: torch.dtype):
+        gate_logits = self._router_logits(gate_source)                       # [B, E]
+        tau = self._bounded_scale(self.tau, self.tau_min, self.tau_max)
+        gate_weights = F.softmax(
+            gate_logits.float() / tau, dim=-1)                               # [B, E]
+        self._last_gate_weights = gate_weights
+
+        expert_prompts = self.expert_prompts.to(orig_dtype).unsqueeze(0)     # [1, E, C, D]
+        weights = gate_weights.to(orig_dtype).unsqueeze(-1).unsqueeze(-1)    # [B, E, 1, 1]
+        mixed = (weights * expert_prompts).sum(dim=1)                        # [B, C, D]
+        return mixed.permute(1, 0, 2).to(orig_dtype)                         # [C, B, D]
+
+    def expert_diversity_loss(self):
+        """Penalise high cosine similarity between expert prompts."""
+        if not self.add_prompt:
+            return self._zero_loss()
+        E = self.expert_prompts.shape[0]
+        if E <= 1:
+            return self._zero_loss()
+        flat = F.normalize(self.expert_prompts.reshape(E, -1), dim=-1)
+        sim = flat @ flat.T
+        mask = torch.triu(torch.ones(E, E, device=flat.device), diagonal=1).bool()
+        return sim[mask].clamp(min=0).mean()
+
+    def load_balance_loss(self):
+        """Encourage the batch-average router usage to stay near uniform."""
+        if self._last_gate_weights is None or not self.add_prompt:
+            return self._zero_loss()
+        avg_weights = self._last_gate_weights.mean(dim=0)
+        target = torch.full_like(avg_weights, 1.0 / self.num_experts)
+        return F.mse_loss(avg_weights, target)
+
+    def moe_aux_losses(self):
+        return self.load_balance_loss(), self.expert_diversity_loss()
+
+    def forward(self, x: torch.Tensor):
+        orig_dtype = x.dtype
+        self._last_gate_weights = None
+
+        if self.add_prompt:
+            if not self.text_layer:
+                prefix = x[0:x.shape[0] - self.n_ctx_visual, :, :]
+                base_prompt = self.base_prompt.to(orig_dtype)
+                base_prompt = base_prompt.unsqueeze(0).expand(x.shape[1], -1, -1)
+                base_prompt = base_prompt.permute(1, 0, 2)                   # [C, B, D]
+                mixed_prompt = self._mix_expert_prompt(prefix, orig_dtype)
+                moe_delta = mixed_prompt - base_prompt
+                alpha = self._bounded_scale(self.alpha, self.alpha_min, self.alpha_max).to(orig_dtype)
+                visual_context = base_prompt + alpha.view(1, 1, 1) * moe_delta
+                visual_context = visual_context.to(orig_dtype)
+
+                x = torch.cat([prefix, visual_context], dim=0)
+            else:
+                prefix = x[:1, :, :]
+                suffix = x[1 + self.n_ctx_text:, :, :]
+                gate_source = torch.cat([prefix, suffix], dim=0)
+                base_prompt = self.base_prompt.to(orig_dtype)
+                base_prompt = base_prompt.unsqueeze(0).expand(x.shape[1], -1, -1)
+                base_prompt = base_prompt.permute(1, 0, 2)                   # [C, B, D]
+                mixed_prompt = self._mix_expert_prompt(gate_source, orig_dtype)
+                moe_delta = mixed_prompt - base_prompt
+                alpha = self._bounded_scale(self.alpha, self.alpha_min, self.alpha_max).to(orig_dtype)
+                textual_context = base_prompt + alpha.view(1, 1, 1) * moe_delta
+                textual_context = textual_context.to(orig_dtype)
+
+                x = torch.cat([prefix, textual_context, suffix], dim=0)
+
+        if not self.text_layer:
+            self.visual_feat = x
+
+        x = x + self.attention(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
+        return x
+
 
 class ResidualAttentionBlock_MaPLe(nn.Module):
     def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None, design_details=None,
@@ -343,6 +622,281 @@ class ResidualAttentionBlock_MaPLe(nn.Module):
         return [x, compound_prompts_deeper, counter]  # return again as a list, so that nn.seq can work
 
 
+class ResidualAttentionBlock_MaPLe_MoE(nn.Module):
+    def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None,
+                 design_details=None, text_layer=False, i: int = 0):
+        super().__init__()
+
+        self.attn = nn.MultiheadAttention(d_model, n_head)
+        self.ln_1 = LayerNorm(d_model)
+        self.mlp = nn.Sequential(OrderedDict([
+            ("c_fc", nn.Linear(d_model, d_model * 4)),
+            ("gelu", QuickGELU()),
+            ("c_proj", nn.Linear(d_model * 4, d_model))
+        ]))
+        self.ln_2 = LayerNorm(d_model)
+        # For the first iteration i, we do not need to add the learnable parameters here
+        # as it will be added in the beginning, for both text and the vision branch
+        self.text_layer = text_layer
+        self.attn_mask = attn_mask
+        # This must be consistent with the config file prompt
+        self.compound_prompt_nctx = design_details['maple_length']
+        if i == 0:
+            self.first_layer = True
+        else:
+            self.first_layer = False
+
+        # --- MoE Prompt Specific Initialization ---
+        self.num_experts = design_details["num_experts"]
+        self.n_ctx = design_details["maple_length"]
+
+        expert_prompts = torch.empty(self.num_experts, self.n_ctx, d_model)
+        nn.init.normal_(expert_prompts, std=0.02)
+        self.expert_prompts = nn.Parameter(expert_prompts)  # [E, C, D]
+        
+        self.gate = nn.Linear(d_model, self.num_experts)
+
+    def attention(self, x: torch.Tensor):
+        self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
+        return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
+
+    def _mix_expert_prompt(self, prefix: torch.Tensor, orig_dtype: torch.dtype):
+        # prefix: [L, B, D]
+        gate_in = prefix.permute(1, 0, 2)                # [B, L, D]
+        logits = self.gate(gate_in)                       # [B, L, E]
+        weights = F.softmax(logits, dim=-1).mean(dim=1)   # [B, E]
+
+        expert = self.expert_prompts.to(orig_dtype)       # [E, C, D]
+        expert = expert.unsqueeze(0)                      # [1, E, C, D]
+        weights = weights.unsqueeze(-1).unsqueeze(-1)     # [B, E, 1, 1]
+        mixed = (weights * expert).sum(dim=1)             # [B, C, D]
+        return mixed.permute(1, 0, 2)                     # [C, B, D]
+
+    def forward(self, inputs):
+        # For the first layer, we do not need to add any duplicate, as it is already added
+        # as the shallow version
+        x = inputs[0]
+        compound_prompts_deeper = inputs[1]
+        counter = inputs[2]
+        orig_dtype = x.dtype
+
+        # 若不是第一层，可执行 prompt 替换与 MoE
+        if not self.first_layer:
+            # --------- 1) 先执行 MaPLe 深层 prompt 替换 ---------
+            if len(compound_prompts_deeper) > 0:
+                if not self.text_layer:
+                    if not (counter > len(compound_prompts_deeper) - 1):
+                        prefix = x[0:x.shape[0] - self.compound_prompt_nctx, :, :]
+                        visual_ctx = compound_prompts_deeper[counter]
+                        visual_ctx = visual_ctx.expand(x.shape[1], -1, -1).permute(1, 0, 2).half()
+                        x = torch.cat([prefix, visual_ctx], dim=0)
+                        counter += 1
+                else:
+                    if not (counter > len(compound_prompts_deeper) - 1):
+                        prefix_cls = x[:1, :, :]
+                        suffix = x[1 + self.compound_prompt_nctx:, :, :]
+                        textual_ctx = compound_prompts_deeper[counter]
+                        textual_ctx = textual_ctx.expand(x.shape[1], -1, -1).permute(1, 0, 2).half()
+                        x = torch.cat([prefix_cls, textual_ctx, suffix], dim=0)
+                        counter += 1
+
+            # --------- 2) 再执行 MoE 混合 ---------
+            if not self.text_layer:
+                prefix = x[0:x.shape[0] - self.compound_prompt_nctx, :, :]
+                moe_prompt = self._mix_expert_prompt(prefix, orig_dtype)
+                x = torch.cat([prefix, moe_prompt], dim=0)
+            else:
+                prefix_cls = x[:1, :, :]
+                suffix = x[1 + self.compound_prompt_nctx:, :, :]
+                body = torch.cat([prefix_cls, suffix], dim=0)
+                moe_prompt = self._mix_expert_prompt(body, orig_dtype)
+                x = torch.cat([prefix_cls, moe_prompt, suffix], dim=0)
+
+        # # Store feature in forward pass
+        if not self.text_layer:
+            self.visual_feat = x
+            
+        # 正常 Transformer 残差
+        x = x + self.attention(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
+        return [x, compound_prompts_deeper, counter]
+
+
+class ResidualAttentionBlock_MaPLe_MoE_Aware(nn.Module):
+    """
+    Alignment-Aware Soft MoE for MaPLe.
+    Key improvements over MaPLe_MoE:
+      1. Configurable CLS/token-mean/hybrid gating on normalized features
+      2. Bounded alpha/tau to stabilize optimization
+      3. Residual fusion: compound_prompt + alpha * (mixed_prompt - compound_prompt)
+      4. expert_diversity_loss() preventing expert collapse
+      5. load_balance_loss() for balanced routing
+    """
+    def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None,
+                 design_details=None, text_layer=False, i: int = 0):
+        super().__init__()
+
+        self.attn = nn.MultiheadAttention(d_model, n_head)
+        self.ln_1 = LayerNorm(d_model)
+        self.mlp = nn.Sequential(OrderedDict([
+            ("c_fc", nn.Linear(d_model, d_model * 4)),
+            ("gelu", QuickGELU()),
+            ("c_proj", nn.Linear(d_model * 4, d_model))
+        ]))
+        self.ln_2 = LayerNorm(d_model)
+        self.text_layer = text_layer
+        self.attn_mask = attn_mask
+        self.compound_prompt_nctx = design_details['maple_length']
+        self.first_layer = (i == 0)
+
+        self.num_experts = design_details["num_experts"]
+        self.n_ctx = design_details["maple_length"]
+        self.delta_scale_init = design_details.get("delta_scale_init", 0.1)
+        self.gate_mode = design_details.get("gate_mode", "hybrid")
+        self.gate_hybrid_lambda = design_details.get("gate_hybrid_lambda", 0.7)
+        self.alpha_min = design_details.get("alpha_min", 0.0)
+        self.alpha_max = design_details.get("alpha_max", 2.0)
+        self.tau_min = design_details.get("tau_min", 0.3)
+        self.tau_max = design_details.get("tau_max", 3.0)
+        self._last_gate_weights = None
+        self.add_prompt = not self.first_layer
+
+        if self.gate_mode not in {"cls", "token_mean", "hybrid"}:
+            raise ValueError(f"Unsupported gate mode: {self.gate_mode}")
+
+        if self.add_prompt:
+            expert_prompts = torch.empty(self.num_experts, self.n_ctx, d_model)
+            nn.init.normal_(expert_prompts, std=0.02)
+            self.expert_prompts = nn.Parameter(expert_prompts)  # [E, C, D]
+            self.gate = nn.Linear(d_model, self.num_experts)
+            tau_init = min(max(1.0, self.tau_min), self.tau_max)
+            alpha_init = min(max(self.delta_scale_init, max(self.alpha_min, 1e-6)), self.alpha_max)
+            self.tau = nn.Parameter(torch.full((1,), _inverse_softplus(tau_init)))
+            self.alpha = nn.Parameter(torch.full((1,), _inverse_softplus(alpha_init)))
+
+    def attention(self, x: torch.Tensor):
+        self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
+        return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
+
+    def _zero_loss(self):
+        return self.ln_1.weight.new_tensor(0.0)
+
+    def _bounded_scale(self, value: torch.Tensor, min_value: float, max_value: float):
+        scale = F.softplus(value.float())
+        if min_value is not None:
+            scale = scale.clamp(min=min_value)
+        if max_value is not None:
+            scale = scale.clamp(max=max_value)
+        return scale
+
+    def _router_logits(self, gate_source: torch.Tensor):
+        tokens = self.ln_1(gate_source)
+        cls_logits = self.gate(tokens[0])
+        if self.gate_mode == "cls":
+            return cls_logits
+
+        token_mean_logits = self.gate(tokens.mean(dim=0))
+        if self.gate_mode == "token_mean":
+            return token_mean_logits
+
+        lambda_cls = max(0.0, min(1.0, float(self.gate_hybrid_lambda)))
+        return lambda_cls * cls_logits + (1.0 - lambda_cls) * token_mean_logits
+
+    def _mix_expert_prompt(self, prefix: torch.Tensor, orig_dtype: torch.dtype):
+        """Soft mixture of expert prompts with configurable routing."""
+        logits = self._router_logits(prefix)                     # [B, E]
+        tau = self._bounded_scale(self.tau, self.tau_min, self.tau_max)
+        weights = F.softmax(
+            logits.float() / tau, dim=-1)                        # [B, E]
+        self._last_gate_weights = weights
+
+        expert = self.expert_prompts.to(orig_dtype).unsqueeze(0) # [1, E, C, D]
+        w = weights.to(orig_dtype).unsqueeze(-1).unsqueeze(-1)   # [B, E, 1, 1]
+        mixed = (w * expert).sum(dim=1)                          # [B, C, D]
+        return mixed.permute(1, 0, 2).to(orig_dtype)             # [C, B, D]
+
+    def expert_diversity_loss(self):
+        """Penalise high cosine similarity between expert prompts."""
+        if not self.add_prompt:
+            return self._zero_loss()
+        E = self.expert_prompts.shape[0]
+        if E <= 1:
+            return self._zero_loss()
+        flat = F.normalize(self.expert_prompts.reshape(E, -1), dim=-1)
+        sim = flat @ flat.T
+        mask = torch.triu(torch.ones(E, E, device=flat.device), diagonal=1).bool()
+        return sim[mask].clamp(min=0).mean()
+
+    def load_balance_loss(self):
+        if self._last_gate_weights is None or not self.add_prompt:
+            return self._zero_loss()
+        avg_weights = self._last_gate_weights.mean(dim=0)
+        target = torch.full_like(avg_weights, 1.0 / self.num_experts)
+        return F.mse_loss(avg_weights, target)
+
+    def moe_aux_losses(self):
+        return self.load_balance_loss(), self.expert_diversity_loss()
+
+    def forward(self, inputs):
+        x = inputs[0]
+        compound_prompts_deeper = inputs[1]
+        counter = inputs[2]
+        orig_dtype = x.dtype
+        self._last_gate_weights = None
+
+        if self.add_prompt:
+            if not self.text_layer:
+                prefix = x[:x.shape[0] - self.compound_prompt_nctx, :, :]
+
+                # Retrieve MaPLe compound prompt as the shared cross-modal base
+                maple_prompt = None
+                if len(compound_prompts_deeper) > 0 and not (counter > len(compound_prompts_deeper) - 1):
+                    maple_prompt = compound_prompts_deeper[counter]
+                    maple_prompt = maple_prompt.expand(x.shape[1], -1, -1).permute(1, 0, 2)
+                    counter += 1
+
+                mixed_prompt = self._mix_expert_prompt(prefix, orig_dtype)
+                alpha = self._bounded_scale(self.alpha, self.alpha_min, self.alpha_max).to(orig_dtype)
+
+                if maple_prompt is not None:
+                    maple_prompt = maple_prompt.to(orig_dtype)
+                    fused = maple_prompt + alpha.view(1, 1, 1) * (mixed_prompt - maple_prompt)
+                else:
+                    fused = mixed_prompt
+                fused = fused.to(orig_dtype)
+
+                x = torch.cat([prefix, fused], dim=0)
+            else:
+                prefix_cls = x[:1, :, :]
+                suffix = x[1 + self.compound_prompt_nctx:, :, :]
+
+                maple_prompt = None
+                if len(compound_prompts_deeper) > 0 and not (counter > len(compound_prompts_deeper) - 1):
+                    maple_prompt = compound_prompts_deeper[counter]
+                    maple_prompt = maple_prompt.expand(x.shape[1], -1, -1).permute(1, 0, 2)
+                    counter += 1
+
+                body = torch.cat([prefix_cls, suffix], dim=0)
+                mixed_prompt = self._mix_expert_prompt(body, orig_dtype)
+                alpha = self._bounded_scale(self.alpha, self.alpha_min, self.alpha_max).to(orig_dtype)
+
+                if maple_prompt is not None:
+                    maple_prompt = maple_prompt.to(orig_dtype)
+                    fused = maple_prompt + alpha.view(1, 1, 1) * (mixed_prompt - maple_prompt)
+                else:
+                    fused = mixed_prompt
+                fused = fused.to(orig_dtype)
+
+                x = torch.cat([prefix_cls, fused, suffix], dim=0)
+
+        if not self.text_layer:
+            self.visual_feat = x
+
+        x = x + self.attention(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
+        return [x, compound_prompts_deeper, counter]
+
+
 class Transformer(nn.Module):
     def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None, prompts_needed=0,
                  text_layer=False, design_details=None):
@@ -351,21 +905,58 @@ class Transformer(nn.Module):
         self.layers = layers
         # Implements respective encoder blocks for a given design choice
         current_trainer = design_details['trainer']
-        if current_trainer == 'IVLP' or current_trainer == 'VPT' or current_trainer == 'VLPromptAlign':
+        if current_trainer == 'IVLP' or current_trainer == 'VPT':
             self.resblocks = nn.Sequential(*[ResidualAttentionBlock_IVLP(width, heads, attn_mask, True,
                                                                          text_layer, i,
                                                                          design_details) if prompts_needed > i
                                              else ResidualAttentionBlock_IVLP(width, heads, attn_mask, False,
                                                                               text_layer, i, design_details)
                                              for i in range(layers)])
-        elif current_trainer == 'MaPLe' or current_trainer == 'PromptAlign':
+        elif current_trainer == 'MaPLe':
             self.resblocks = nn.Sequential(
                 *[ResidualAttentionBlock_MaPLe(width, heads, attn_mask, design_details, text_layer, i)
                   for i in range(layers)])
+        elif current_trainer == 'MaPLe_MoE':
+            self.resblocks = nn.Sequential(
+                *[ResidualAttentionBlock_MaPLe_MoE(width, heads, attn_mask, design_details, text_layer, i)
+                  for i in range(layers)])
+        elif current_trainer == 'IVLP_MoE' or current_trainer == 'VPT_MoE':
+            self.resblocks = nn.Sequential(*[ResidualAttentionBlock_IVLP_MoE(width, heads, attn_mask, True,
+                                                                         text_layer, i,
+                                                                         design_details) if prompts_needed > i
+                                             else ResidualAttentionBlock_IVLP_MoE(width, heads, attn_mask, False,
+                                                                              text_layer, i, design_details)
+                                             for i in range(layers)])
+        elif current_trainer == 'MaPLe_MoE_Aware' or current_trainer == 'TAME_VLJ':
+            self.resblocks = nn.Sequential(
+                *[ResidualAttentionBlock_MaPLe_MoE_Aware(width, heads, attn_mask, design_details, text_layer, i)
+                  for i in range(layers)])
+        elif current_trainer in ('IVLP_MoE_Aware', 'VPT_MoE_Aware', 'TAME_V', 'TAME_VLI'):
+            self.resblocks = nn.Sequential(*[ResidualAttentionBlock_IVLP_MoE_Aware(width, heads, attn_mask, True,
+                                                                         text_layer, i,
+                                                                         design_details) if prompts_needed > i
+                                             else ResidualAttentionBlock_IVLP_MoE_Aware(width, heads, attn_mask, False,
+                                                                              text_layer, i, design_details)
+                                             for i in range(layers)])
         else:
             # Corresponds to default CoOp or CoCoOp
             assert current_trainer == 'CoOp' or current_trainer == 'CoCoOp'
             self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
+
+    def moe_aux_losses(self):
+        if len(self.resblocks) == 0:
+            zero = torch.tensor(0.0)
+            return zero, zero
+
+        zero = self.resblocks[0].ln_1.weight.new_tensor(0.0)
+        balance = zero
+        diversity = zero
+        for block in self.resblocks:
+            if hasattr(block, "moe_aux_losses"):
+                block_balance, block_diversity = block.moe_aux_losses()
+                balance = balance + block_balance
+                diversity = diversity + block_diversity
+        return balance, diversity
 
     def forward(self, x: torch.Tensor):
         return self.resblocks(x)
@@ -520,7 +1111,7 @@ class CLIP(nn.Module):
             )
         else:
             vision_heads = vision_width // 64
-            if trainer == "MaPLe" or trainer == 'PromptAlign':
+            if trainer in ("MaPLe", "MaPLe_MoE", "MaPLe_MoE_Aware", "TAME_VLJ"):
                 self.visual = VisionTransformer_MaPLe(
                     input_resolution=image_resolution,
                     patch_size=vision_patch_size,

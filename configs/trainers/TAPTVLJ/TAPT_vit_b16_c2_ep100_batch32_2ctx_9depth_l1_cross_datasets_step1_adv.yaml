@@ -3,7 +3,7 @@ DATALOADER:
     BATCH_SIZE: 4
   TEST:
     BATCH_SIZE: 100
-  NUM_WORKERS: 8
+  NUM_WORKERS: 16
 
 INPUT:
   SIZE: (224, 224)
@@ -29,7 +29,7 @@ MODEL:
     NAME: "ViT-B/16"
 
 TRAINER:
-  PROMPTALIGN:
+  TAPTVLJ:
     N_CTX: 2
     CTX_INIT: "a photo of a"
     PREC: "fp16"
@@ -50,7 +50,7 @@ TAPT:
 
 AT:
   TEST:
-    EPS: 4
+    EPS: 1
     ALPHA: 1
     STEPS: 100
   ALIGN_TYPE: "l1"

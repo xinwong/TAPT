@@ -76,11 +76,11 @@ def load_clip_to_cpu(cfg):
 
     except RuntimeError:
         state_dict = torch.load(model_path, map_location="cpu")
-    design_details = {"trainer": 'PromptAlign',
+    design_details = {"trainer": 'MaPLe',
                       "vision_depth": 0,
                       "language_depth": 0, "vision_ctx": 0,
                       "language_ctx": 0,
-                      "maple_length": cfg.TRAINER.PROMPTALIGN.N_CTX}
+                      "maple_length": cfg.TRAINER.TAPTVLJ.N_CTX}
     model = clip.build_model(state_dict or model.state_dict(), design_details)
 
     return model
@@ -97,7 +97,7 @@ def load_clip_to_cpu_dummy(cfg):
 
     except RuntimeError:
         state_dict = torch.load(model_path, map_location="cpu")
-    design_details = {"trainer": 'IVLP',
+    design_details = {"trainer": 'MaPLe',
                       "vision_depth": 0,
                       "language_depth": 0, 
                       "vision_ctx": 0,
@@ -138,15 +138,16 @@ class MultiModalPromptLearner(nn.Module):
         super().__init__()
         self.learned_cls = False  # Just copied, check if setting to True
         n_cls = len(classnames)
-        n_ctx = cfg.TRAINER.PROMPTALIGN.N_CTX
-        ctx_init = cfg.TRAINER.PROMPTALIGN.CTX_INIT
+        n_ctx = cfg.TRAINER.TAPTVLJ.N_CTX
+        ctx_init = cfg.TRAINER.TAPTVLJ.CTX_INIT
         dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
+        vision_ctx_dim = clip_model.visual.conv1.weight.shape[0]
         clip_imsize = clip_model.visual.input_resolution
         cfg_imsize = cfg.INPUT.SIZE[0]
         # Default is 1, which is compound shallow prompting
-        assert cfg.TRAINER.PROMPTALIGN.PROMPT_DEPTH >= 1, "For MaPLe, PROMPT_DEPTH should be >= 1"
-        self.compound_prompts_depth = cfg.TRAINER.PROMPTALIGN.PROMPT_DEPTH  # max=12, but will create 11 such shared prompts
+        assert cfg.TRAINER.TAPTVLJ.PROMPT_DEPTH >= 1, "For MaPLe, PROMPT_DEPTH should be >= 1"
+        self.compound_prompts_depth = cfg.TRAINER.TAPTVLJ.PROMPT_DEPTH  # max=12, but will create 11 such shared prompts
         assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
 
         if ctx_init and (n_ctx) <= 4:
@@ -168,7 +169,7 @@ class MultiModalPromptLearner(nn.Module):
         print(f"Number of MaPLe context words (tokens): {n_ctx}")
         # These below, related to the shallow prompts
         # Linear layer so that the tokens will project to 512 and will be initialized from 768
-        self.proj = nn.Linear(ctx_dim, 768)
+        self.proj = nn.Linear(ctx_dim, vision_ctx_dim)
         # self.proj.half()
         self.ctx = nn.Parameter(ctx_vectors)
         self.proj_weight_init_state = self.proj.weight.detach().clone()
@@ -180,7 +181,7 @@ class MultiModalPromptLearner(nn.Module):
 
         # Minimum can be 1, which defaults to shallow MaPLe
         # compound prompts
-        self.compound_prompts_text = nn.ParameterList([nn.Parameter(torch.empty(n_ctx, 512))
+        self.compound_prompts_text = nn.ParameterList([nn.Parameter(torch.empty(n_ctx, ctx_dim))
                                                       for _ in range(self.compound_prompts_depth - 1)])
         for single_para in self.compound_prompts_text:
             nn.init.normal_(single_para, std=0.02)
@@ -188,7 +189,7 @@ class MultiModalPromptLearner(nn.Module):
         self.compound_prompts_text_init_state = [txt_prompt.detach().clone() for txt_prompt in self.compound_prompts_text]
 
         # Also make corresponding projection layers, for each prompt
-        single_layer = nn.Linear(ctx_dim, 768)
+        single_layer = nn.Linear(ctx_dim, vision_ctx_dim)
         self.compound_prompt_projections = _get_clones(single_layer, self.compound_prompts_depth - 1)
         self.compound_prompt_projections_init_state = [(module.weight.detach().clone(), module.bias.detach().clone()) for module in self.compound_prompt_projections]
 
@@ -682,7 +683,7 @@ class TAPTVLJ(TrainerX):
 
 
     def check_cfg(self, cfg):
-        assert cfg.TRAINER.PROMPTALIGN.PREC in ["fp16", "fp32", "amp"]
+        assert cfg.TRAINER.TAPTVLJ.PREC in ["fp16", "fp32", "amp"]
 
     def build_model(self):
         cfg = self.cfg
@@ -691,7 +692,7 @@ class TAPTVLJ(TrainerX):
         print(f"Loading CLIP (backbone: {cfg.MODEL.BACKBONE.NAME})")
         clip_model = load_clip_to_cpu(cfg)
 
-        if cfg.TRAINER.PROMPTALIGN.PREC == "fp32" or cfg.TRAINER.PROMPTALIGN.PREC == "amp":
+        if cfg.TRAINER.TAPTVLJ.PREC == "fp32" or cfg.TRAINER.TAPTVLJ.PREC == "amp":
             # CLIP's default precision is fp16
             clip_model.float()
 
@@ -725,7 +726,7 @@ class TAPTVLJ(TrainerX):
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
         self.register_model("MultiModalPromptLearner", self.model, self.optim, self.sched)
 
-        self.scaler = GradScaler() if cfg.TRAINER.PROMPTALIGN.PREC == "amp" else None
+        self.scaler = GradScaler() if cfg.TRAINER.TAPTVLJ.PREC == "amp" else None
 
         # Note that multi-gpu training could be slow because CLIP's size is
         # big, which slows down the copy operation in DataParallel
@@ -741,7 +742,7 @@ class TAPTVLJ(TrainerX):
         optim = self.optim
         scaler = self.scaler
 
-        prec = self.cfg.TRAINER.PROMPTALIGN.PREC
+        prec = self.cfg.TRAINER.TAPTVLJ.PREC
         if prec == "amp":
             with autocast():
                 loss = model(image, label)
@@ -816,7 +817,7 @@ class TAPTVLJ(TrainerX):
         print("load adv dataset: {}".format(adv_dataset_pkl_path))
         
         if os.path.isfile(adv_dataset_pkl_path):
-            self.adv_test_pkl, _ = torch.load(adv_dataset_pkl_path).tensors
+            self.adv_test_pkl, _ = torch.load(adv_dataset_pkl_path, weights_only=False).tensors
             return
         else:
             raise FileNotFoundError('Adv dataset not found at "{}"'.format(adv_dataset_pkl_path))
@@ -854,7 +855,7 @@ class TAPTVLJ(TrainerX):
         # Load the adversarial dataset
         # print(self.cfg.AT.ADV_DIR)
         adv_dataset_pkl_path = os.path.join(self.cfg.AT.ADV_DIR, self.cfg.DATASET.NAME + "_adv_dataset.pkl")
-        adv_dataset_pkl = torch.load(adv_dataset_pkl_path)  # Assuming the .pkl file contains a dataset object
+        adv_dataset_pkl = torch.load(adv_dataset_pkl_path, weights_only=False)  # Assuming the .pkl file contains a dataset object
         print("load adv dataset: {}".format(adv_dataset_pkl_path))
 
         # Wrap the loaded dataset with TransformDataset to apply transformations
@@ -1152,7 +1153,7 @@ class TAPTVLJ(TrainerX):
         return 0.5 * (F.kl_div(F.log_softmax(p, dim=-1), F.softmax(m, dim=-1), reduction='batchmean') + F.kl_div(F.log_softmax(q, dim=-1), F.softmax(m, dim=-1), reduction='batchmean'))
 
     @torch.no_grad()
-    def save_and_compute_means(self, split=None, save_path='./statistics/VLJ/'):
+    def save_and_compute_means(self, split=None, save_path='./stats/vitb32/'):
         """
         Saving feature maps (i.e. tokens from transformer) and calculating mean in batches
         """
@@ -1194,13 +1195,16 @@ class TAPTVLJ(TrainerX):
 
         mean_visual_feat = running_mean.cuda()
 
+        # Extract model name from save_path (e.g., 'vitb16' from './stats/vitb16/')
+        model_name = save_path.rstrip('/').split('/')[-1]
+
         print(f"******Saving means embedding to {save_path}*********")
-        torch.save(mean_visual_feat, save_path + "imagenet_means.pt")
+        torch.save(mean_visual_feat, save_path + "VLJ_means_{}_{}_clean.pt".format(model_name, split))
 
         self.save_and_compute_var(split, mean_visual_feat, data_loader, save_path)
 
     @torch.no_grad()
-    def save_and_compute_var(self, split=None, mean_visual_feat=None, data_loader=None, save_path='./statistics/VLJ/'):
+    def save_and_compute_var(self, split=None, mean_visual_feat=None, data_loader=None, save_path='./stats/vitb32/'):
         """
         Saving feature maps (i.e. tokens from transformer) and calculating variance in batches
         """
@@ -1235,8 +1239,11 @@ class TAPTVLJ(TrainerX):
         var_visual_feat = sum_squared_diff / (total_samples - 1)  # Use (total_samples - 1) for sample variance
         var_visual_feat = var_visual_feat.cuda()
 
+        # Extract model name from save_path (e.g., 'vitb16' from './stats/vitb16/')
+        model_name = save_path.rstrip('/').split('/')[-1]
+
         print(f"******Saving vars embedding to {save_path}*********")
-        torch.save(var_visual_feat, save_path + "imagenet_vars.pt")
+        torch.save(var_visual_feat, save_path + "VLJ_vars_{}_{}_clean.pt".format(model_name, split))
 
         results = self.evaluator.evaluate()
         for k, v in results.items():

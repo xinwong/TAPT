@@ -1,14 +1,11 @@
 import os.path as osp
-from collections import OrderedDict
 import math
-import copy
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.cuda.amp import GradScaler, autocast
 
 from dassl.engine import TRAINER_REGISTRY, TrainerX
-from dassl.metrics import compute_accuracy
 from dassl.utils import load_pretrained_weights, load_checkpoint
 from dassl.optim import build_optimizer, build_lr_scheduler
 
@@ -17,30 +14,79 @@ import torch.backends.cudnn as cudnn
 import os
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
-import PIL
 from PIL import Image
 try:
     from torchvision.transforms import InterpolationMode
     BICUBIC = InterpolationMode.BICUBIC
 except ImportError:
     BICUBIC = Image.BICUBIC
-import math
 import json
 import random
 from torch.utils.data import Dataset
 import numpy as np
-from utils import Summary, ProgressMeter, accuracy, load_model_weight, set_random_seed, AverageMeter
+from utils import Summary, ProgressMeter, accuracy, AverageMeter
 import time
 from tqdm import tqdm
 
 from clip import clip
-from clip import tokenize
 from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 
 _tokenizer = _Tokenizer()
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
+
+MOE_STATE_NAMES = ("expert_prompts", "gate", "tau", "alpha", "base_prompt")
+
+
+def is_moe_state_parameter(name):
+    return any(key in name for key in MOE_STATE_NAMES)
+
+
+def is_trainable_moe_parameter(name, train_tau=True, train_base_prompt=True):
+    if "tau" in name and not train_tau:
+        return False
+    if "base_prompt" in name and not train_base_prompt:
+        return False
+    return is_moe_state_parameter(name)
+
+
+def unwrap_model(model):
+    return model.module if isinstance(model, nn.DataParallel) else model
+
+
+def is_moe_gate_parameter(name):
+    return "gate.weight" in name or "gate.bias" in name
+
+
+def is_moe_scale_parameter(name):
+    return ("alpha" in name) or ("tau" in name)
+
+
+def build_moe_param_groups(model, base_lr, weight_decay, lr_mult_gate, lr_mult_scale):
+    prompt_params = []
+    gate_params = []
+    scale_params = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if is_moe_scale_parameter(name):
+            scale_params.append(param)
+        elif is_moe_gate_parameter(name):
+            gate_params.append(param)
+        else:
+            prompt_params.append(param)
+
+    param_groups = []
+    if prompt_params:
+        param_groups.append({"params": prompt_params, "lr": base_lr, "weight_decay": weight_decay})
+    if gate_params:
+        param_groups.append({"params": gate_params, "lr": base_lr * lr_mult_gate, "weight_decay": weight_decay})
+    if scale_params:
+        param_groups.append({"params": scale_params, "lr": base_lr * lr_mult_scale, "weight_decay": 0.0})
+
+    return param_groups
 
 class TransformDataset(Dataset):
     def __init__(self, dataset, transform=None):
@@ -57,6 +103,7 @@ class TransformDataset(Dataset):
         return image, label
 
 def load_clip_to_cpu(cfg):
+    moe_cfg = cfg.TRAINER.TAMEVLI
     backbone_name = cfg.MODEL.BACKBONE.NAME
     url = clip._MODELS[backbone_name]
     model_path = clip._download(url)
@@ -68,11 +115,19 @@ def load_clip_to_cpu(cfg):
 
     except RuntimeError:
         state_dict = torch.load(model_path, map_location="cpu")
-    design_details = {"trainer": 'IVLP',
-                      "vision_depth": cfg.TRAINER.TAPTVLI.PROMPT_DEPTH_VISION,
-                      "language_depth": cfg.TRAINER.TAPTVLI.PROMPT_DEPTH_TEXT,
-                      "vision_ctx": cfg.TRAINER.TAPTVLI.N_CTX_VISION,
-                      "language_ctx": cfg.TRAINER.TAPTVLI.N_CTX_TEXT}
+    design_details = {"trainer": 'TAME_VLI',
+                      "vision_depth": moe_cfg.PROMPT_DEPTH_VISION,
+                      "language_depth": moe_cfg.PROMPT_DEPTH_TEXT,
+                      "vision_ctx": moe_cfg.N_CTX_VISION,
+                      "language_ctx": moe_cfg.N_CTX_TEXT,
+                      "num_experts": moe_cfg.NUM_EXPERTS,
+                      "delta_scale_init": moe_cfg.DELTA_SCALE_INIT,
+                      "gate_mode": moe_cfg.GATE_MODE,
+                      "gate_hybrid_lambda": moe_cfg.GATE_HYBRID_LAMBDA,
+                      "alpha_min": moe_cfg.ALPHA_MIN,
+                      "alpha_max": moe_cfg.ALPHA_MAX,
+                      "tau_min": moe_cfg.TAU_MIN,
+                      "tau_max": moe_cfg.TAU_MAX}
     model = clip.build_model(state_dict or model.state_dict(), design_details)
 
     return model
@@ -104,17 +159,17 @@ class TextEncoder(nn.Module):
 class VLPromptLearner(nn.Module):
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
-        self.learned_cls = False  # Just copied, check if setting to True
+        moe_cfg = cfg.TRAINER.TAMEVLI
+        self.learned_cls = False
         n_cls = len(classnames)
         # Make sure Language depth >= 1
-        assert cfg.TRAINER.TAPTVLI.PROMPT_DEPTH_TEXT >= 1, "In Independent VL prompting, Language prompt depth should be >=1" \
+        assert moe_cfg.PROMPT_DEPTH_TEXT >= 1, "In Independent VL prompting, Language prompt depth should be >=1" \
                                                         "\nPlease use VPT trainer if you want to learn only vision " \
                                                         "branch  "
-        n_ctx = cfg.TRAINER.TAPTVLI.N_CTX_TEXT
-        ctx_init = cfg.TRAINER.TAPTVLI.CTX_INIT
+        n_ctx = moe_cfg.N_CTX_TEXT
+        ctx_init = moe_cfg.CTX_INIT
         dtype = clip_model.dtype
         ctx_dim = clip_model.ln_final.weight.shape[0]
-        vis_dim = clip_model.visual.output_dim
         clip_imsize = clip_model.visual.input_resolution
         cfg_imsize = cfg.INPUT.SIZE[0]
         assert cfg_imsize == clip_imsize, f"cfg_imsize ({cfg_imsize}) must equal to clip_imsize ({clip_imsize})"
@@ -133,11 +188,15 @@ class VLPromptLearner(nn.Module):
             ctx_vectors = torch.empty(n_ctx, ctx_dim, dtype=dtype)
             nn.init.normal_(ctx_vectors, std=0.02)
             prompt_prefix = " ".join(["X"] * n_ctx)
-        print(f"Adversarial Independent V-L design")
+        print("TAME-VLI design")
         print(f'Initial text context: "{prompt_prefix}"')
         print(f"Number of context words (tokens) for Language prompting: {n_ctx}")
-        print(f"Number of context words (tokens) for Vision prompting: {cfg.TRAINER.TAPTVLI.N_CTX_VISION}")
+        print(f"Number of context words (tokens) for Vision prompting: {moe_cfg.N_CTX_VISION}")
         self.ctx = nn.Parameter(ctx_vectors)
+        self.ctx_init_state = ctx_vectors.detach().clone()
+        self.prompt_prefix = prompt_prefix
+        self.ctx_dim = ctx_dim
+        self.dtype = dtype
 
         classnames = [name.replace("_", " ") for name in classnames]
         name_lens = [len(_tokenizer.encode(name)) for name in classnames]
@@ -157,6 +216,7 @@ class VLPromptLearner(nn.Module):
         self.n_ctx = n_ctx
         self.tokenized_prompts = tokenized_prompts  # torch.Tensor
         self.name_lens = name_lens
+        self.classnames = classnames
 
 
     def construct_prompts(self, ctx, prefix, suffix, label=None):
@@ -199,8 +259,6 @@ class VLPromptLearner(nn.Module):
             self.cls.copy_(cls_vectors)
 
     def reset_classnames(self, classnames, args):
-        print("==================================")
-        print(args)
         self.device = self.ctx.device
         self.n_cls = len(classnames)
         if not self.learned_cls:
@@ -208,23 +266,21 @@ class VLPromptLearner(nn.Module):
             name_lens = [len(_tokenizer.encode(name)) for name in classnames]
             prompts = [self.prompt_prefix + " " + name + "." for name in classnames]
         else:
-            cls_vectors = torch.empty(self.n_cls, 1, self.ctx_dim, dtype=self.dtype) # assume each learnable cls_token is only 1 word
+            cls_vectors = torch.empty(self.n_cls, 1, self.ctx_dim, dtype=self.dtype)
             nn.init.normal_(cls_vectors, std=0.02)
             cls_token = "X"
             name_lens = [1 for _ in classnames]
             prompts = [self.prompt_prefix + " " + cls_token + "." for _ in classnames]
-            # TODO: re-init the cls parameters
-            # self.cls = nn.Parameter(cls_vectors) # to be optimized
             self.cls_init_state = cls_vectors.detach().clone()
-        tokenized_prompts = torch.cat([tokenize(p) for p in prompts]).to(self.device)
 
-        clip = load_clip_to_cpu(args).to(self.device)
+        tokenized_prompts = torch.cat([clip.tokenize(p) for p in prompts]).to(self.device)
+        clip_model = load_clip_to_cpu(args).to(self.device)
 
         with torch.no_grad():
-            embedding = clip.token_embedding(tokenized_prompts).type(self.dtype)
+            embedding = clip_model.token_embedding(tokenized_prompts).type(self.dtype)
 
         self.token_prefix = embedding[:, :1, :]
-        self.token_suffix = embedding[:, 1 + self.n_ctx :, :]  # CLS, EOS
+        self.token_suffix = embedding[:, 1 + self.n_ctx :, :]
 
         self.name_lens = name_lens
         self.tokenized_prompts = tokenized_prompts
@@ -241,18 +297,40 @@ class VLPromptLearner(nn.Module):
 class CustomCLIP(nn.Module):
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
+        self.cfg = cfg
+        self.moe_cfg = cfg.TRAINER.TAMEVLI
         self.prompt_learner = VLPromptLearner(cfg, classnames, clip_model)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoder(clip_model)
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
+        self.moe_aux_loss_scale = 1.0
         self.vpt_initial_states = {}
         for name, param in self.named_parameters():
             if "VPT" in name:
                 self.vpt_initial_states[name] = param.detach().clone()
+        self.moe_initial_states = {}
+        for name, param in self.named_parameters():
+            if is_moe_state_parameter(name):
+                self.moe_initial_states[name] = param.detach().clone()
                 
         self.normalize = transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])
+
+    def compute_moe_aux_loss(self):
+        total_balance = self.logit_scale.new_tensor(0.0)
+        total_diversity = self.logit_scale.new_tensor(0.0)
+        for transformer in (self.image_encoder.transformer, self.text_encoder.transformer):
+            if hasattr(transformer, "moe_aux_losses"):
+                balance, diversity = transformer.moe_aux_losses()
+                total_balance = total_balance + balance
+                total_diversity = total_diversity + diversity
+        balance_w = getattr(self.moe_cfg, "AUX_BALANCE_W_TARGET", self.moe_cfg.AUX_BALANCE_W)
+        diversity_w = getattr(self.moe_cfg, "AUX_DIVERSITY_W_TARGET", self.moe_cfg.AUX_DIVERSITY_W)
+        return self.moe_aux_loss_scale * (balance_w * total_balance + diversity_w * total_diversity)
+
+    def set_moe_aux_loss_scale(self, scale):
+        self.moe_aux_loss_scale = float(scale)
 
     def forward(self, image, label=None):
         image = self.normalize(image)
@@ -269,7 +347,7 @@ class CustomCLIP(nn.Module):
         logits = logit_scale * image_features @ text_features.t()
 
         if self.prompt_learner.training:
-            return F.cross_entropy(logits, label)
+            return F.cross_entropy(logits, label) + self.compute_moe_aux_loss()
 
         return logits
 
@@ -289,19 +367,24 @@ class CustomCLIP(nn.Module):
             if "VPT" in name:
                 # print(name)
                 param.copy_(self.vpt_initial_states[name])
+            # 恢复 MoE 相关参数
+            if is_moe_state_parameter(name):
+                if name in self.moe_initial_states:
+                    param.copy_(self.moe_initial_states[name])
 
     def reset_classnames(self, classnames, arch):
         self.prompt_learner.reset_classnames(classnames, arch)
         self.tokenized_prompts = self.prompt_learner.tokenized_prompts
 
+    @torch.no_grad()
     def set_prompt_inits(self):
         print("Re-updating prompt initializations to current prompts.")
         self.prompt_learner.set_prompt_init_states()
-
-
-def _get_clones(module, N):
-    return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
-
+        for name, param in self.named_parameters():
+            if "VPT" in name:
+                self.vpt_initial_states[name] = param.detach().clone()
+            if is_moe_state_parameter(name):
+                self.moe_initial_states[name] = param.detach().clone()
 
 ID_to_DIRNAME={
     'PUG': 'PUG_ImageNet',
@@ -439,7 +522,7 @@ def get_preaugment():
         ])
 
 def augmix(image, preprocess, aug_list, severity=1):
-    preaugment = get_preaugment()   # Resizing with scaling and ratio
+    preaugment = get_preaugment()
     x_orig = preaugment(image)
     x_processed = preprocess(x_orig)
     if len(aug_list) == 0:
@@ -458,14 +541,14 @@ def augmix(image, preprocess, aug_list, severity=1):
 
 
 class AugMixAugmenter(object):
-    def __init__(self, base_transform, preprocess, n_views=2, augmix=False, 
+    def __init__(self, base_transform, preprocess, n_views=2, augmix=False,
                     severity=1):
         self.base_transform = base_transform
         self.preprocess = preprocess
         self.n_views = n_views
         self.aug_list = []
         self.severity = severity
-        
+
     def __call__(self, x):
         image = self.preprocess(self.base_transform(x))
         views = [augmix(x, self.preprocess, self.aug_list, self.severity) for _ in range(self.n_views)]
@@ -477,7 +560,7 @@ class AdvAugMixAugmenter(object):
         self.n_views = n_views
         self.aug_list = []
         self.severity = severity
-        
+
     def __call__(self, x):
         image = self.preprocess(x)
         views = [augmix(x, self.preprocess, self.aug_list, self.severity) for _ in range(self.n_views)]
@@ -486,7 +569,17 @@ class AdvAugMixAugmenter(object):
 
 
 @TRAINER_REGISTRY.register()
-class TAPTVLI(TrainerX):
+class TAMEVLI(TrainerX):
+
+    def save_feature_maps(self, save_path='./output/features/'):
+        return self.save_and_compute_feature_maps(save_path=save_path)
+
+    def build_pug_dataset(self, set_id, data_root, transform):
+        setting = set_id.split('_')[1]
+        pug_dir = pug_setting_dir[setting]
+        testdir = os.path.join(data_root, ID_to_DIRNAME['PUG'], pug_dir)
+        testset = datasets.ImageFolder(testdir, transform=transform)
+        return testset
 
     def build_fewshot_dataset(self, set_id, root, transform, mode='train', n_shot=None):
         if set_id.lower() == 'aircraft':
@@ -509,6 +602,8 @@ class TAPTVLI(TrainerX):
                 testset = self.build_fewshot_dataset(set_id, os.path.join(data_root, ID_to_DIRNAME[set_id.lower()]), transform, mode=mode, n_shot=n_shot)
             else:
                 testset = self.build_fewshot_dataset(set_id, os.path.join(data_root, ID_to_DIRNAME[set_id.lower()]), transform, mode=mode)
+        elif 'PUG' in set_id:
+            testset = self.build_pug_dataset(set_id, data_root, transform=transform)
         else:
             raise NotImplementedError
             
@@ -516,6 +611,9 @@ class TAPTVLI(TrainerX):
 
     def build_data_loader(self):
         super().build_data_loader()
+        if not self.cfg.TAPT.LOADER:
+            self.tapt_loader = None
+            return
         print("Test-Time Adversarial Loader: ", self.cfg.AT.ADVALIGN)
         if self.cfg.AT.ADVALIGN:
             self.tapt_loader = self.get_tapt_adv_dataloader(self.cfg.TAPT)
@@ -523,15 +621,7 @@ class TAPTVLI(TrainerX):
             self.tapt_loader = self.get_tapt_dataloader(self.cfg.TAPT)
 
     def get_tapt_dataloader(self, args):
-        print("Loading pre-computed means and vars")
-        self.visual_vars = torch.load(args.VIS_VARS)
-        self.visual_means = torch.load(args.VIS_MEANS)
-        self.visual_vars_clean = torch.load(args.VIS_VARS_CLEAN)
-        self.visual_means_clean = torch.load(args.VIS_MEANS_CLEAN)
-        print("source adv visual vars: {}, Path: {}".format(self.visual_vars.shape, args.VIS_VARS))
-        print("source adv visual means: {}, Path: {}".format(self.visual_means.shape, args.VIS_MEANS))
-        print("source clean visual vars: {}, Path: {}".format(self.visual_vars_clean.shape, args.VIS_VARS_CLEAN))
-        print("source clean visual means: {}, Path: {}".format(self.visual_means_clean.shape, args.VIS_MEANS_CLEAN))
+        self.load_visual_distribution_targets(args)
 
         # normalize = transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
         #                                  std=[0.26862954, 0.26130258, 0.27577711])
@@ -544,7 +634,7 @@ class TAPTVLI(TrainerX):
                 transforms.ToTensor(),
                 # normalize,
             ])
-            data_transform = AugMixAugmenter(base_transform, preprocess, n_views=args.BATCH_SIZE-1, 
+            data_transform = AugMixAugmenter(base_transform, preprocess, n_views=args.BATCH_SIZE-1,
                                             augmix=False)
             batchsize = 1
         else:
@@ -578,24 +668,115 @@ class TAPTVLI(TrainerX):
         min_real = torch.finfo(avg_logits.dtype).min
         avg_logits = torch.clamp(avg_logits, min=min_real)
         return -(avg_logits * torch.exp(avg_logits)).sum(dim=-1)
-    
+
     def distr_align_loss(self, out_feat, targ_feat, layers_from=0, layers_to=12, moments=5):
-        '''
-        A feature distibution alignment L1 loss between mean and variance of the features
-        '''
         distr_loss = 0
         out_means, out_vars = out_feat
         targ_means, targ_vars = targ_feat
-        transf_layers = layers_to
-        for l in range(layers_from, transf_layers-1):
+        for l in range(layers_from, layers_to):
             out_mean, out_var = out_means[l], out_vars[l]
             targ_mean, targ_var = targ_means[l], targ_vars[l]
             distr_loss += 0.5 * F.l1_loss(out_mean, targ_mean) + 0.5 * F.l1_loss(out_var, targ_var)
         return distr_loss
 
-
     def check_cfg(self, cfg):
-        assert cfg.TRAINER.TAPTVLI.PREC in ["fp16", "fp32", "amp"]
+        assert cfg.TRAINER.TAMEVLI.PREC in ["fp16", "fp32", "amp"]
+
+    def resolve_align_layers(self, args):
+        layers_from = int(args.ALIGN_LAYER_FROM)
+        layers_to = int(args.ALIGN_LAYER_TO)
+        num_layers = len(unwrap_model(self.model).image_encoder.transformer.resblocks)
+
+        if not (0 <= layers_from < layers_to <= num_layers):
+            raise ValueError(
+                "Invalid ALIGN_LAYER range: "
+                f"ALIGN_LAYER_FROM={layers_from}, ALIGN_LAYER_TO={layers_to}, "
+                f"valid range requires 0 <= FROM < TO <= {num_layers}"
+            )
+
+        return list(range(layers_from, layers_to))
+
+    def resolve_align_token_scope(self, args):
+        scope = str(getattr(args, "ALIGN_TOKEN_SCOPE", "all")).lower()
+        if scope != "all":
+            raise ValueError("Final view256 TAMEVLI supports only ALIGN_TOKEN_SCOPE=all")
+        return scope
+
+    def get_visual_token_count(self, model=None):
+        base_model = unwrap_model(model if model is not None else self.model)
+        image_encoder = base_model.image_encoder
+        token_count = int(image_encoder.positional_embedding.shape[0])
+        if hasattr(image_encoder, "VPT") and image_encoder.VPT is not None:
+            token_count += int(image_encoder.VPT.shape[0])
+        return token_count
+
+    def compute_visual_token_distribution(self, visual_feats):
+        feat_mean = visual_feats.mean(dim=1)
+        feat_var = ((visual_feats - feat_mean.unsqueeze(1)) ** 2).mean(dim=1)
+        return feat_mean, feat_var
+
+    def build_stats_output_path(self, save_path, kind, split, checkpoint_variant):
+        model_name = save_path.rstrip('/').split('/')[-1]
+        return os.path.join(
+            save_path,
+            f"TAME_VIL_{kind}_{model_name}_{split}_{checkpoint_variant}.pt",
+        )
+
+    def save_visual_stats(self, save_path, kind, split, checkpoint_variant, tensor):
+        torch.save(
+            tensor,
+            self.build_stats_output_path(save_path, kind, split, checkpoint_variant),
+        )
+
+    def load_visual_distribution_targets(self, args):
+        self.resolve_align_token_scope(args)
+
+        print("Loading pre-computed means and vars")
+        self.visual_vars = torch.load(args.VIS_VARS)
+        self.visual_means = torch.load(args.VIS_MEANS)
+        self.visual_vars_clean = torch.load(args.VIS_VARS_CLEAN)
+        self.visual_means_clean = torch.load(args.VIS_MEANS_CLEAN)
+
+        print("source adv visual vars: {}, Path: {}".format(self.visual_vars.shape, args.VIS_VARS))
+        print("source adv visual means: {}, Path: {}".format(self.visual_means.shape, args.VIS_MEANS))
+        print("source clean visual vars: {}, Path: {}".format(self.visual_vars_clean.shape, args.VIS_VARS_CLEAN))
+        print("source clean visual means: {}, Path: {}".format(self.visual_means_clean.shape, args.VIS_MEANS_CLEAN))
+
+        return "all"
+
+    def validate_loaded_align_targets(self, model, args):
+        self.resolve_align_token_scope(args)
+        expected_tokens = self.get_visual_token_count(model)
+
+        stats_to_check = [
+            ("VIS_MEANS", self.visual_means),
+            ("VIS_VARS", self.visual_vars),
+            ("VIS_MEANS_CLEAN", self.visual_means_clean),
+            ("VIS_VARS_CLEAN", self.visual_vars_clean),
+        ]
+        for name, tensor in stats_to_check:
+            if int(tensor.shape[1]) != expected_tokens:
+                raise ValueError(
+                    f"{name} token count mismatch: expected {expected_tokens}, got {tensor.shape[1]} "
+                    "for ALIGN_TOKEN_SCOPE=all"
+                )
+
+    def get_moe_aux_loss_scale(self):
+        moe_cfg = self.cfg.TRAINER.TAMEVLI
+        warmup_epochs = max(int(getattr(moe_cfg, "AUX_WARMUP_EPOCHS", 1)), 1)
+        current_epoch = getattr(self, "epoch", 0) + 1
+        return min(1.0, current_epoch / warmup_epochs)
+
+    def build_moe_optimizer(self, base_lr):
+        moe_cfg = self.cfg.TRAINER.TAMEVLI
+        param_groups = build_moe_param_groups(
+            self.model,
+            base_lr=base_lr,
+            weight_decay=self.cfg.OPTIM.WEIGHT_DECAY,
+            lr_mult_gate=moe_cfg.LR_MULT_GATE,
+            lr_mult_scale=moe_cfg.LR_MULT_SCALE,
+        )
+        return build_optimizer(self.model, self.cfg.OPTIM, param_groups=param_groups)
 
     def build_model(self):
         cfg = self.cfg
@@ -605,7 +786,7 @@ class TAPTVLI(TrainerX):
 
         clip_model = load_clip_to_cpu(cfg)
 
-        if cfg.TRAINER.TAPTVLI.PREC == "fp32" or cfg.TRAINER.TAPTVLI.PREC == "amp":
+        if cfg.TRAINER.TAMEVLI.PREC == "fp32" or cfg.TRAINER.TAMEVLI.PREC == "amp":
             # CLIP's default precision is fp16
             clip_model.float()
 
@@ -614,11 +795,13 @@ class TAPTVLI(TrainerX):
 
         print("Turning off gradients in both the image and the text encoder")
         name_to_update = "prompt_learner"
+        train_tau = cfg.TRAINER.TAMEVLI.TRAIN_TAU
+        train_base_prompt = cfg.TRAINER.TAMEVLI.TRAIN_BASE_PROMPT
 
         for name, param in self.model.named_parameters():
             if name_to_update not in name:
                 # Make sure that VPT prompts are updated
-                if "VPT" in name:
+                if "VPT" in name or is_trainable_moe_parameter(name, train_tau, train_base_prompt):
                     param.requires_grad_(True)
                 else:
                     param.requires_grad_(False)
@@ -634,12 +817,11 @@ class TAPTVLI(TrainerX):
             load_pretrained_weights(self.model, cfg.MODEL.INIT_WEIGHTS)
 
         self.model.to(self.device)
-        # NOTE: only give prompt_learner to the optimizer
-        self.optim = build_optimizer(self.model, cfg.OPTIM)
+        self.optim = self.build_moe_optimizer(cfg.OPTIM.LR)
         self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
         self.register_model("VLPromptLearner", self.model, self.optim, self.sched)
 
-        self.scaler = GradScaler() if cfg.TRAINER.TAPTVLI.PREC == "amp" else None
+        self.scaler = GradScaler() if cfg.TRAINER.TAMEVLI.PREC == "amp" else None
 
         # Note that multi-gpu training could be slow because CLIP's size is
         # big, which slows down the copy operation in DataParallel
@@ -654,8 +836,9 @@ class TAPTVLI(TrainerX):
         model = self.model
         optim = self.optim
         scaler = self.scaler
+        unwrap_model(model).set_moe_aux_loss_scale(self.get_moe_aux_loss_scale())
 
-        prec = self.cfg.TRAINER.TAPTVLI.PREC
+        prec = self.cfg.TRAINER.TAMEVLI.PREC
         if prec == "amp":
             with autocast():
                 loss = model(image, label)
@@ -717,38 +900,18 @@ class TAPTVLI(TrainerX):
             # set strict=False
             self._models[name].load_state_dict(state_dict, strict=False)
 
-    def before_adv_align(self):
-        r"""
-        Arguments:
-            eps (float): maximum perturbation. (Default: 4/255)
-            alpha (float): step size. (Default: 1/255)
-            steps (int): number of steps. (Default: 10)
-            random_start (bool): using random initialization of delta. (Default: True)
-        """
-        
+    def before_adv_align(self, attack='PGD', eps=4/255, alpha=1/255, steps=100):
         adv_dataset_pkl_path = os.path.join(self.cfg.AT.ADV_DIR, self.cfg.DATASET.NAME + "_adv_dataset.pkl")
         print("load adv dataset: {}".format(adv_dataset_pkl_path))
-
-        # If inputs were normalized, then
-        # attacker.set_normalization_used(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])
 
         if os.path.isfile(adv_dataset_pkl_path):
             self.adv_test_pkl, _ = torch.load(adv_dataset_pkl_path, weights_only=False).tensors
             return
-        else:
-            raise FileNotFoundError('Adv dataset not found at "{}"'.format(adv_dataset_pkl_path))
 
+        raise FileNotFoundError('Adv dataset not found at "{}"'.format(adv_dataset_pkl_path))
 
     def get_tapt_adv_dataloader(self, args):
-        print("Loading pre-computed means and vars")
-        self.visual_vars = torch.load(args.VIS_VARS)
-        self.visual_means = torch.load(args.VIS_MEANS)
-        self.visual_vars_clean = torch.load(args.VIS_VARS_CLEAN)
-        self.visual_means_clean = torch.load(args.VIS_MEANS_CLEAN)
-        print("source adv visual vars: {}, Path: {}".format(self.visual_vars.shape, args.VIS_VARS))
-        print("source adv visual means: {}, Path: {}".format(self.visual_means.shape, args.VIS_MEANS))
-        print("source clean visual vars: {}, Path: {}".format(self.visual_vars_clean.shape, args.VIS_VARS_CLEAN))
-        print("source clean visual means: {}, Path: {}".format(self.visual_means_clean.shape, args.VIS_MEANS_CLEAN))
+        self.load_visual_distribution_targets(args)
 
         # normalize = transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073],
         #                                  std=[0.26862954, 0.26130258, 0.27577711])
@@ -790,9 +953,25 @@ class TAPTVLI(TrainerX):
         Run Test-time prompt Tuning
         """
         self.model.set_prompt_inits()   # Init with current prompts
+        unwrap_model(self.model).set_moe_aux_loss_scale(1.0)
+        train_tau = self.cfg.TRAINER.TAMEVLI.TRAIN_TAU
+        train_base_prompt = self.cfg.TRAINER.TAMEVLI.TRAIN_BASE_PROMPT
+        freeze_moe_at_tta = bool(getattr(self.cfg.TAPT, "FREEZE_MOE_AT_TTA", False))
+        if freeze_moe_at_tta:
+            print("[TAPT] FREEZE_MOE_AT_TTA=True -> freezing MoE routing params (gate/tau/alpha/expert_prompts/base_prompt) at test-time")
         for name, param in self.model.named_parameters():
             if not self.cfg.TAPT.COCOOP: # MaPLe and CoOp
-                if "prompt_learner" not in name and "VPT" not in name:
+                is_moe = any(k in name for k in MOE_STATE_NAMES)
+                is_default_trainable = (
+                    "prompt_learner" in name
+                    or "VPT" in name
+                    or is_trainable_moe_parameter(name, train_tau, train_base_prompt)
+                )
+                if freeze_moe_at_tta and is_moe:
+                    param.requires_grad_(False)
+                elif is_default_trainable:
+                    param.requires_grad_(True)
+                else:
                     param.requires_grad_(False)
             else:
                 if "text_encoder" not in name:
@@ -803,22 +982,48 @@ class TAPTVLI(TrainerX):
             optimizer = None
             optim_state = None
         else:
-            # trainable_param = self.model.prompt_learner.parameters()
-            trainable_param = []
             for name, param in self.model.named_parameters():
                 if param.requires_grad:
                     print(name)
-                    trainable_param.append(param)
-            optimizer = torch.optim.AdamW(trainable_param, self.cfg.TAPT.LR)
+            param_groups = build_moe_param_groups(
+                self.model,
+                base_lr=self.cfg.TAPT.LR,
+                weight_decay=self.cfg.OPTIM.WEIGHT_DECAY,
+                lr_mult_gate=self.cfg.TRAINER.TAMEVLI.LR_MULT_GATE,
+                lr_mult_scale=self.cfg.TRAINER.TAMEVLI.LR_MULT_SCALE,
+            )
+            optimizer = torch.optim.AdamW(param_groups, lr=self.cfg.TAPT.LR, weight_decay=self.cfg.OPTIM.WEIGHT_DECAY)
             optim_state = deepcopy(optimizer.state_dict())
 
         # setup automatic mixed-precision (Amp) loss scaling
         scaler = torch.cuda.amp.GradScaler(init_scale=1000)
 
+        reset_interval = int(getattr(self.cfg.TAPT, "RESET", 1))
+        if reset_interval < 1:
+            raise ValueError(f"TAPT.RESET must be >= 1, got {reset_interval}")
+        align_layers = self.resolve_align_layers(self.cfg.TAPT)
+        align_token_scope = self.resolve_align_token_scope(self.cfg.TAPT)
+        token_count = self.get_visual_token_count(self.model)
+        self.validate_loaded_align_targets(self.model, self.cfg.TAPT)
+
         # for name, parameters in self.model.named_parameters():
         #     print(name + " " + str(parameters.requires_grad))
                     
         print('=> Using native Torch AMP. Training in mixed precision.')
+        print(
+            "TAMEVLI TTA config: "
+            f"TTA_STEPS={self.cfg.TAPT.TTA_STEPS}, "
+            f"RESET={reset_interval}, "
+            "optimizer_state_reload=per-sample"
+        )
+        print(
+            "TAMEVLI align blocks (FROM inclusive, TO exclusive): "
+            f"{align_layers}"
+        )
+        print(
+            "TAMEVLI align token scope: "
+            f"{align_token_scope} (tokens={token_count})"
+        )
         print("number of test samples: {}".format(len(self.tapt_loader.dataset)))
         print("DATASET.TAPT: {}".format(self.cfg.DATASET.TAPT))
         cudnn.benchmark = True
@@ -849,6 +1054,7 @@ class TAPTVLI(TrainerX):
         model.eval()
 
         reset_counter = 0  # Initialize the counter
+        reset_interval = int(getattr(args, "RESET", 1))
 
         if not args.COCOOP: # no need to reset cocoop because it's fixed
             with torch.no_grad():
@@ -884,7 +1090,7 @@ class TAPTVLI(TrainerX):
                 reset_counter += 1
 
                 if args.TTA_STEPS > 0:
-                    if reset_counter % self.cfg.TAPT.RESET == 0:  # Reset every 4 iterations
+                    if reset_counter % reset_interval == 0:
                         # print(reset_counter)
                         with torch.no_grad():
                             model.reset()
@@ -930,11 +1136,14 @@ class TAPTVLI(TrainerX):
         
         selected_idx = None
         gamma = self.cfg.TAPT.GAMMA # 1 adv, 0 clean
+        base_model = unwrap_model(model)
+        self.resolve_align_token_scope(args)
 
         for j in range(args.TTA_STEPS):
             with torch.cuda.amp.autocast():
 
                 output = model(inputs) 
+                loss = base_model.compute_moe_aux_loss()
 
                 if selected_idx is not None:
                     output = output[selected_idx]
@@ -942,29 +1151,45 @@ class TAPTVLI(TrainerX):
                     output, selected_idx = self.select_confident_samples(output, args.TAPT_THRESHOLD, args.ALIGN_THRESHOLD)
 
                 if args.TAPT_LOSS:
-                    loss = self.avg_entropy(output)
+                    loss = loss + self.avg_entropy(output)
 
                 # Only selected indexes
                 target_feat_distr = (self.visual_means, self.visual_vars)
                 target_clean_feat_distr = (self.visual_means_clean, self.visual_vars_clean)
-                out_visual_mean = torch.cat([torch.mean(res.visual_feat[:, selected_idx, :], dim=1, keepdims=True).permute(1,0,2) for res in model.image_encoder.transformer.resblocks])
-                out_visual_var = torch.cat([torch.mean(((res.visual_feat[:, selected_idx, :] - out_visual_mean[i, :, :].unsqueeze(0).permute(1,0,2))**2), dim=1, keepdims=True).permute(1,0,2) for i, res in enumerate(model.image_encoder.transformer.resblocks)])
-                out_feat_distr = (out_visual_mean, out_visual_var)
+                layer_visual_feats = torch.stack(
+                    [
+                        res.visual_feat[:, selected_idx, :].permute(1, 0, 2)
+                        for res in base_model.image_encoder.transformer.resblocks
+                    ],
+                    dim=0,
+                )
+                out_feat_distr = self.compute_visual_token_distribution(layer_visual_feats)
 
                 if args.DISTR_ALIGN:
                     DISTR_LOSS_W = args.DISTR_LOSS_W / (args.ALIGN_LAYER_TO - args.ALIGN_LAYER_FROM)
 
-                    # Calculate the distribution alignment loss components
-                    if self.cfg.AT.ALIGN_TYPE == "multi":
-                        align_loss_func = lambda x, y: self.multistage_align_loss(x, y, current_step=j, args=args, switch_fraction=0.5)
+                    align_type = str(self.cfg.AT.ALIGN_TYPE).lower()
+                    if align_type == "multi":
+                        align_loss_func = lambda x, y: self.multistage_align_loss(
+                            x,
+                            y,
+                            current_step=j,
+                            args=args,
+                            switch_fraction=0.5,
+                        )
                     else:
-                        align_loss_func = lambda x, y: self.onestage_align_loss(x, y, layers_from=args.ALIGN_LAYER_FROM, layers_to=args.ALIGN_LAYER_TO, align_type=self.cfg.AT.ALIGN_TYPE)
-
+                        align_loss_func = lambda x, y: self.onestage_align_loss(
+                            x,
+                            y,
+                            layers_from=args.ALIGN_LAYER_FROM,
+                            layers_to=args.ALIGN_LAYER_TO,
+                            align_type=align_type,
+                        )
                     loss_tapt_adv = align_loss_func(out_feat_distr, target_feat_distr)
                     loss_tapt_clean = align_loss_func(out_feat_distr, target_clean_feat_distr)
 
                     distr_loss = DISTR_LOSS_W * (loss_tapt_adv * gamma + loss_tapt_clean * (1 - gamma))
-                    loss = distr_loss if not args.TAPT_LOSS else loss + distr_loss
+                    loss = loss + distr_loss
 
             optimizer.zero_grad()
             # compute gradient and do SGD step
@@ -975,31 +1200,22 @@ class TAPTVLI(TrainerX):
 
         return
 
+    def base_align_l1_loss(self, out_mean, out_var, targ_mean, targ_var):
+        return 0.5 * F.l1_loss(out_mean, targ_mean) + 0.5 * F.l1_loss(out_var, targ_var)
+
     def multistage_align_loss(self, out_feat_distr, target_feat_distr, current_step, args, switch_fraction=0.5):
-        """
-        Calculates the multi-stage distribution alignment loss.
+        k = 2
+        alpha = 1 / (1 + math.exp(-k * (current_step - args.TTA_STEPS * switch_fraction)))
 
-        Args:
-            out_feat_distr: Tuple of (out_visual_mean, out_visual_var) for the current batch.
-            target_feat_distr: Tuple of (target_visual_mean, target_visual_var) for the target distribution.
-            current_step: Current step in the align process.
-            args: Align arguments.
-
-        Returns:
-            The calculated multi-stage loss.
-        """
-        # Sigmoid smooth interpolation switch
-        k = 2  # Controls the steepness of the sigmoid function
-        alpha = 1 / (1 + math.exp(-k * (current_step - args.TTA_STEPS * switch_fraction)))  # Calculate the alpha value using sigmoid
-
-        # Define helper function for calculating loss
         def calculate_loss(align_type):
-            return self.onestage_align_loss(out_feat_distr, target_feat_distr, 
-                                            layers_from=args.ALIGN_LAYER_FROM,
-                                            layers_to=args.ALIGN_LAYER_TO, 
-                                            align_type=align_type)
+            return self.onestage_align_loss(
+                out_feat_distr,
+                target_feat_distr,
+                layers_from=args.ALIGN_LAYER_FROM,
+                layers_to=args.ALIGN_LAYER_TO,
+                align_type=align_type,
+            )
 
-        # Calculate L1 and MMD losses
         loss_l1 = calculate_loss('l1')
         loss_mmd = calculate_loss('mmd')
 
@@ -1013,20 +1229,22 @@ class TAPTVLI(TrainerX):
         out_means, out_vars = out_feat
         targ_means, targ_vars = targ_feat
 
-        # Choose the correct loss function based on align_type
-        for l in range(layers_from, layers_to - 1):
+        for l in range(layers_from, layers_to):
             out_mean, out_var = out_means[l], out_vars[l]
             targ_mean, targ_var = targ_means[l], targ_vars[l]
 
-            # Compute the appropriate loss based on align_type
             if align_type == 'l1':
-                distr_loss += 0.5 * F.l1_loss(out_mean, targ_mean) + 0.5 * F.l1_loss(out_var, targ_var)
+                distr_loss += self.base_align_l1_loss(out_mean, out_var, targ_mean, targ_var)
             elif align_type == 'l2':
                 distr_loss += 0.5 * F.mse_loss(out_mean, targ_mean) + 0.5 * F.mse_loss(out_var, targ_var)
             elif align_type == 'mmd':
                 distr_loss += self.compute_mmd(out_mean, targ_mean, sigma)
             elif align_type == 'kl':
-                distr_loss += F.kl_div(F.log_softmax(out_mean, dim=-1), F.softmax(targ_mean, dim=-1), reduction='batchmean') 
+                distr_loss += F.kl_div(
+                    F.log_softmax(out_mean, dim=-1),
+                    F.softmax(targ_mean, dim=-1),
+                    reduction='batchmean',
+                )
             elif align_type == 'js':
                 distr_loss += self.compute_js_div(out_mean, targ_mean)
             else:
@@ -1035,29 +1253,89 @@ class TAPTVLI(TrainerX):
         return distr_loss
 
     def compute_mmd(self, x, y, sigma=1.0):
-        """
-        Compute the Maximum Mean Discrepancy (MMD) between two samples.
-        """
         x_kernel = self.gaussian_kernel(x, x, sigma)
         y_kernel = self.gaussian_kernel(y, y, sigma)
         xy_kernel = self.gaussian_kernel(x, y, sigma)
         return torch.mean(x_kernel) + torch.mean(y_kernel) - 2 * torch.mean(xy_kernel)
 
     def gaussian_kernel(self, x, y, sigma):
-        """
-        Compute the Gaussian kernel between two samples.
-        """
         return torch.exp(-torch.sum((x[:, None, :] - y[None, :, :]) ** 2, dim=2) / (2 * (sigma ** 2)))
 
     def compute_js_div(self, p, q):
-        """
-        Compute the Jensen-Shannon Divergence between two probability distributions.
-        """
         m = 0.5 * (p + q)
-        return 0.5 * (F.kl_div(F.log_softmax(p, dim=-1), F.softmax(m, dim=-1), reduction='batchmean') + F.kl_div(F.log_softmax(q, dim=-1), F.softmax(m, dim=-1), reduction='batchmean'))
+        return 0.5 * (
+            F.kl_div(F.log_softmax(p, dim=-1), F.softmax(m, dim=-1), reduction='batchmean')
+            + F.kl_div(F.log_softmax(q, dim=-1), F.softmax(m, dim=-1), reduction='batchmean')
+        )
 
     @torch.no_grad()
-    def save_and_compute_means(self, split=None, save_path='./stats/vitb32/'):
+    def save_and_compute_feature_maps(self, split=None, save_path='./stats/vitb16/'):
+        """
+        Saving feature maps (i.e. tokens from transformer)
+        """
+        self.set_model_mode("eval")
+        self.evaluator.reset()
+
+        if split is None:
+            split = self.cfg.TEST.SPLIT
+
+        if split == "val" and self.val_loader is not None:
+            data_loader = self.val_loader
+        elif split == "test":   # in case val_loader is None
+            data_loader = self.test_loader
+        elif split == "train":  # in case val_loader is None
+            data_loader = self.train_loader_x
+
+        print(f"Calculate var and mean on the *{split}* set")        
+        all_visual_feats = []
+        checkpoint_variant = getattr(self, "stats_variant", "adv")
+
+        for batch_idx, batch in enumerate(tqdm(data_loader)):
+            input, label = self.parse_batch_test(batch)
+            output = self.model_inference(input)
+
+            visual_feats = torch.stack([res.visual_feat.permute(1, 0, 2) for res in self.model.image_encoder.transformer.resblocks], dim=1)
+            all_visual_feats.append(visual_feats.cpu())
+
+            # Process output and labels
+            self.evaluator.process(output, label)
+
+        # Concatenate all the visual features across batches and compute the mean
+        all_visual_feats = torch.cat(all_visual_feats, dim=0)
+        print("all_visual_feats shape: ", all_visual_feats.shape)
+
+        mean_visual_feat = all_visual_feats.mean(dim=0).cuda()
+        var_visual_feat = all_visual_feats.var(dim=0).cuda()
+
+        del all_visual_feats
+
+        print(f"******Saving feature maps to {save_path}*********")
+        self.save_visual_stats(
+            save_path,
+            "vis_means",
+            split,
+            checkpoint_variant,
+            mean_visual_feat,
+        )
+        self.save_visual_stats(
+            save_path,
+            "vis_vars",
+            split,
+            checkpoint_variant,
+            var_visual_feat,
+        )
+
+        results = self.evaluator.evaluate()
+
+        # Save evaluation results
+        for k, v in results.items():
+            tag = f"{split}/{k}"
+            self.write_scalar(tag, v, self.epoch)
+
+        return list(results.values())[0]
+
+    @torch.no_grad()
+    def save_and_compute_means(self, split=None, save_path='./stats/TAME/vitb16/'):
         """
         Saving feature maps (i.e. tokens from transformer) and calculating mean in batches
         """
@@ -1101,16 +1379,21 @@ class TAPTVLI(TrainerX):
 
         mean_visual_feat = running_mean.cuda()
 
-        # Extract model name from save_path (e.g., 'vitb16' from './stats/vitb16/')
-        model_name = save_path.rstrip('/').split('/')[-1]
+        checkpoint_variant = getattr(self, "stats_variant", "adv")
 
         print(f"******Saving means embedding to {save_path}*********")
-        torch.save(mean_visual_feat, save_path + "VLI_means_{}_{}_clean.pt".format(model_name, split))
+        self.save_visual_stats(
+            save_path,
+            "means",
+            split,
+            checkpoint_variant,
+            mean_visual_feat,
+        )
 
         self.save_and_compute_var(split, mean_visual_feat, data_loader, save_path)
 
     @torch.no_grad()
-    def save_and_compute_var(self, split=None, mean_visual_feat=None, data_loader=None, save_path='./stats/vitb32/'):
+    def save_and_compute_var(self, split=None, mean_visual_feat=None, data_loader=None, save_path='./stats/TAME/vitb16/'):
         """
         Saving feature maps (i.e. tokens from transformer) and calculating variance in batches
         """
@@ -1145,11 +1428,16 @@ class TAPTVLI(TrainerX):
         var_visual_feat = sum_squared_diff / (total_samples - 1)  # Use (total_samples - 1) for sample variance
         var_visual_feat = var_visual_feat.cuda()
 
-        # Extract model name from save_path (e.g., 'vitb16' from './stats/vitb16/')
-        model_name = save_path.rstrip('/').split('/')[-1]
+        checkpoint_variant = getattr(self, "stats_variant", "adv")
 
         print(f"******Saving vars embedding to {save_path}*********")
-        torch.save(var_visual_feat, save_path + "VLI_vars_{}_{}_clean.pt".format(model_name, split))
+        self.save_visual_stats(
+            save_path,
+            "vars",
+            split,
+            checkpoint_variant,
+            var_visual_feat,
+        )
 
         results = self.evaluator.evaluate()
         for k, v in results.items():

@@ -1,6 +1,6 @@
 DATALOADER:
   TRAIN_X:
-    BATCH_SIZE: 4
+    BATCH_SIZE: 1024
   TEST:
     BATCH_SIZE: 100
   NUM_WORKERS: 16
@@ -26,7 +26,7 @@ TRAIN:
 
 MODEL:
   BACKBONE:
-    NAME: "ViT-B/16"
+    NAME: "ViT-B/32"
 
 TRAINER:
   TAPTVLI:
@@ -57,4 +57,3 @@ AT:
     STEPS: 100
   ALIGN_TYPE: "l1"
   ADVALIGN: False
-  
