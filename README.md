@@ -21,7 +21,7 @@ class="center">
 
 # Environment Setup
 
-To set up the required environment, please follow the installation instructions provided in the [Train-Time APT repository](https://github.com/xinwong/Multimodal-Adversarial-Prompt-Tuning.git).
+To set up the required environment, please follow the installation instructions provided in the [Train-Time APT repository](https://github.com/xinwong/MMoP.git).
 
 # Data Preparation
 
@@ -39,19 +39,19 @@ This project provides scripts for test-time tuning and evaluating various prompt
 
 Here are examples of how to run the plain TAPT baselines with a ViT-B/16 backbone in a zero-shot setting:
 
-*   **TAPTVLI (TAPT V-L Independent Prompt):**
+*   **TAPT VLI (TAPT V-L Independent Prompt):**
 
     ```bash
     ./scripts/VLI/TAPT_VLI_0shots_b16.sh
     ```
 
-*   **TAPTVLJ (TAPT V-L Joint Prompt):**
+*   **TAPT VLJ (TAPT V-L Joint Prompt):**
 
     ```bash
     ./scripts/VLJ/TAPT_VLJ_0shots_b16.sh
     ```
 
-*   **TAPTV (TAPT Vision Prompt):**
+*   **TAPT V (TAPT Vision Prompt):**
 
     ```bash
     ./scripts/V/TAPT_V_0shots_b16.sh
@@ -61,19 +61,19 @@ Here are examples of how to run the plain TAPT baselines with a ViT-B/16 backbon
 
 The TAME variants are the test-time counterparts of the train-time MoE schemes (`MoEAdvIVLP` / `MoEAdvMaPLe` / `MoEAdvVPT` in the [MMoP repo](https://github.com/xinwong/MMoP)). `TAMEVLI` is the canonical alignment-aware recipe.
 
-*   **TAMEVLI (MoE V-L Independent Prompt):**
+*   **TAME VLI (MoE V-L Independent Prompt):**
 
     ```bash
     ./scripts/TAMEVLI/TAME_VLI_0shots_b16.sh
     ```
 
-*   **TAMEVLJ (MoE V-L Joint Prompt):**
+*   **TAME VLJ (MoE V-L Joint Prompt):**
 
     ```bash
     ./scripts/TAMEVLJ/TAME_VLJ_0shots_b16.sh
     ```
 
-*   **TAMEV (MoE Vision Prompt):**
+*   **TAME V (MoE Vision Prompt):**
 
     ```bash
     ./scripts/TAMEV/TAME_V_0shots_b16.sh
@@ -85,6 +85,8 @@ This repository is built upon [`PromptAlign`](https://github.com/jameelhassan/Pr
 
 # Citation
 
+# Citation
+
 ```
 @inproceedings{wang2025tapt,
   title={TAPT: Test-Time Adversarial Prompt Tuning for Robust Inference in Vision-Language Models},
@@ -92,5 +94,12 @@ This repository is built upon [`PromptAlign`](https://github.com/jameelhassan/Pr
   booktitle={Proceedings of the Computer Vision and Pattern Recognition Conference},
   pages={19910--19920},
   year={2025}
+}
+
+@article{wang2026tame,
+  title={TAME: Test-Time Adversarial Prompt Tuning via Mixture-of-Experts for Vision-Language Models},
+  author={Wang, Xin and Wang, Yixu and Zhang, Jiaming and Wang, Ruofan and Yu, Jiaqi and Chen, Kai and Chen, Jingjing and Ma, Xingjun and Jiang, Yu-Gang},
+  journal={arXiv preprint arXiv:2605.17577},
+  year={2026}
 }
 ```
