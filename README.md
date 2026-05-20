@@ -37,42 +37,46 @@ This project provides scripts for test-time tuning and evaluating various prompt
 
 ## Example Usage
 
-Here are examples of how to run the retained plain TAPT baselines and the new TAME variants with a ViT-B/16 backbone in a zero-shot setting:
+Here are examples of how to run the plain TAPT baselines with a ViT-B/16 backbone in a zero-shot setting:
 
-*   **TAPTVLI (plain TAPT V-L Independent Prompt):**
+*   **TAPTVLI (TAPT V-L Independent Prompt):**
 
     ```bash
-    ./scripts/VLI/TAPT_VLI_0shots_step1_eps1.sh
+    ./scripts/VLI/TAPT_VLI_0shots_b16.sh
     ```
 
-*   **TAMEVLI (alignment-aware expert V-L Independent Prompt):**
+*   **TAPTVLJ (TAPT V-L Joint Prompt):**
 
     ```bash
-    ./scripts/TAMEVLI/TAPT_TAME_VLI_0shots_auto.sh
+    ./scripts/VLJ/TAPT_VLJ_0shots_b16.sh
     ```
 
-*   **TAPTVLJ (plain TAPT V-L Joint Prompt):**
+*   **TAPTV (TAPT Vision Prompt):**
 
     ```bash
-    ./scripts/VLJ/TAPT_VLJ_0shots_step1_eps1.sh
+    ./scripts/V/TAPT_V_0shots_b16.sh
     ```
 
-*   **TAMEVLJ (alignment-aware expert V-L Joint Prompt):**
+## MoE Variants
+
+The TAME variants are the test-time counterparts of the train-time MoE schemes (`MoEAdvIVLP` / `MoEAdvMaPLe` / `MoEAdvVPT` in the [MMoP repo](https://github.com/xinwong/MMoP)). `TAMEVLI` is the canonical alignment-aware recipe.
+
+*   **TAMEVLI (MoE V-L Independent Prompt):**
 
     ```bash
-    ./scripts/TAMEVLJ/TAPT_TAME_VLJ_0shots_auto.sh
+    ./scripts/TAMEVLI/TAME_VLI_0shots_b16.sh
     ```
 
-*   **TAPTV (plain TAPT Vision Prompt):**
+*   **TAMEVLJ (MoE V-L Joint Prompt):**
 
     ```bash
-    ./scripts/V/TAPT_V_0shots_step1_eps1.sh
+    ./scripts/TAMEVLJ/TAME_VLJ_0shots_b16.sh
     ```
 
-*   **TAMEV (alignment-aware expert Vision Prompt):**
+*   **TAMEV (MoE Vision Prompt):**
 
     ```bash
-    ./scripts/TAMEV/TAPT_TAME_V_0shots_auto.sh
+    ./scripts/TAMEV/TAME_V_0shots_b16.sh
     ```
 
 # Acknowledgement
