@@ -59,7 +59,7 @@ Here are examples of how to run the plain TAPT baselines with a ViT-B/16 backbon
 
 ## MoE Variants
 
-The TAME variants are the test-time counterparts of the train-time MoE schemes (`MoEAdvIVLP` / `MoEAdvMaPLe` / `MoEAdvVPT` in the [MMoP repo](https://github.com/xinwong/MMoP)). `TAMEVLI` is the canonical alignment-aware recipe.
+The TAME variants are the test-time counterparts of the train-time MoE schemes (`MoEAdvIVLP` / `MoEAdvMaPLe` / `MoEAdvVPT` in the [MMoP repo](https://github.com/xinwong/MMoP)).
 
 *   **TAME VLI (MoE V-L Independent Prompt):**
 
