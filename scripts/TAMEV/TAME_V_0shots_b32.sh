@@ -8,7 +8,7 @@ TRAINER=TAMEV
 DATASETS=("caltech101" "dtd" "eurosat" "oxford_pets" "fgvc_aircraft" "oxford_flowers" "food101" "stanford_cars" "sun397" "ucf101" "imagenet")
 SEED=1
 EPOCHS=(100)
-ATTACKS=("pgd" "auto" "di" "ti" "cw")
+ATTACKS=("pgd" "di")
 
 WEIGHTSPATH='/mnt/shared-storage-user/wangxin2/PromptLearning/Multimodal-Adversarial-Prompt-Tuning/output2025/train/imagenet/MoEAdvVPT/vit_b32_c2_ep100_batch32_2ctx_9depth_16shots'
 
