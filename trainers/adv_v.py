@@ -779,7 +779,6 @@ class TAPTV(TAPTV):
         # If inputs were normalized, then
         # attacker.set_normalization_used(mean=[0.48145466, 0.4578275, 0.40821073], std=[0.26862954, 0.26130258, 0.27577711])
 
-        # save_path = "/cpfs01/projects-HDD/cfff-12667fb5c6f8_HDD/wx_22110240041/wangxin/Test-Prompt/multimodal-prompt-learning/output/evaluation/AdvMaPLe/vit_b16_c2_ep100_batch32_2ctx_9depth_cross_datasets_lr0.0035_16shots/oxford_pets/seed1/100/OxfordPets_adv.pkl"
         if os.path.isfile(adv_dataset_pkl_path):
             self.adv_test_pkl, _ = torch.load(adv_dataset_pkl_path, weights_only=False).tensors
             return
