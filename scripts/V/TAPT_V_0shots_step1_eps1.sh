@@ -1,7 +1,7 @@
 ## TAPT Clean Dataset Evaluation
 
 # custom config
-DATA="/shared/VauAI/xinwang/CLIP/"
+DATA="/path/to/your/CLIP/"
 
 TRAINER=TAPTV
 
@@ -9,7 +9,7 @@ DATASETS=("caltech101" "dtd" "eurosat" "oxford_pets" "fgvc_aircraft" "oxford_flo
 SEED=1
 EPOCHS=(100)
 
-WEIGHTSPATH='/cpfs04/user/wangxin2/TAPT++/Multimodal-Adversarial-Prompt-Tuning/output2025/train/imagenet/AdvVPT/vit_b16_c2_ep100_batch32_2ctx_9depth_16shots'
+WEIGHTSPATH='/path/to/your/TAPT++/Multimodal-Adversarial-Prompt-Tuning/output2025/train/imagenet/AdvVPT/vit_b16_c2_ep100_batch32_2ctx_9depth_16shots'
 
 CFG=TAPT_vit_b16_c2_ep100_batch32_2ctx_9depth_l1_cross_datasets_step1_clean
 SHOTS=0
@@ -47,7 +47,7 @@ done
 ## TAPT Adversarial Dataset Evaluation
 
 # custom config
-DATA="/shared/VauAI/xinwang/CLIP/"
+DATA="/path/to/your/CLIP/"
 
 TRAINER=TAPTV
 
@@ -55,7 +55,7 @@ DATASETS=("caltech101" "dtd" "eurosat" "oxford_pets" "fgvc_aircraft" "oxford_flo
 SEED=1
 EPOCHS=(100)
 
-WEIGHTSPATH='/cpfs04/user/wangxin2/TAPT++/Multimodal-Adversarial-Prompt-Tuning/output2025/train/imagenet/AdvVPT/vit_b16_c2_ep100_batch32_2ctx_9depth_16shots'
+WEIGHTSPATH='/path/to/your/TAPT++/Multimodal-Adversarial-Prompt-Tuning/output2025/train/imagenet/AdvVPT/vit_b16_c2_ep100_batch32_2ctx_9depth_16shots'
 
 # Extract the common part from WEIGHTSPATH
 COMMON_PART=$(basename ${WEIGHTSPATH})

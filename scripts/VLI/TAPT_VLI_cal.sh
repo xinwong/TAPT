@@ -1,5 +1,5 @@
 # custom config
-DATA="/mnt/shared-storage-user/wangxin2/CLIP/"
+DATA="/path/to/your/CLIP/"
 
 TRAINER=TAPTVLI
 
@@ -8,8 +8,8 @@ SEED=1
 EPOCHS=(100)
 
 
-# WEIGHTSPATH='/mnt/shared-storage-user/wangxin2/TAPT++/Multimodal-Adversarial-Prompt-Tuning/output2025/train/imagenet/AdvIVLP/vit_b32_c2_ep100_batch32_2+2ctx_9depth_16shots'       # adv
-WEIGHTSPATH='/mnt/shared-storage-user/wangxin2/TAPT++/Multimodal-Adversarial-Prompt-Tuning/output2025/train/imagenet/AdvIVLP/vit_b32_c2_ep100_batch32_2+2ctx_9depth_clean_16shots'     # clean
+# WEIGHTSPATH='/path/to/your/TAPT++/Multimodal-Adversarial-Prompt-Tuning/output2025/train/imagenet/AdvIVLP/vit_b32_c2_ep100_batch32_2+2ctx_9depth_16shots'       # adv
+WEIGHTSPATH='/path/to/your/TAPT++/Multimodal-Adversarial-Prompt-Tuning/output2025/train/imagenet/AdvIVLP/vit_b32_c2_ep100_batch32_2+2ctx_9depth_clean_16shots'     # clean
 
 CFG=TAPT_vit_b32_c2_ep100_batch32_2ctx_9depth_cal
 SHOTS=0
