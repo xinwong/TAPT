@@ -85,8 +85,6 @@ This repository is built upon [`PromptAlign`](https://github.com/jameelhassan/Pr
 
 # Citation
 
-# Citation
-
 ```
 @inproceedings{wang2025tapt,
   title={TAPT: Test-Time Adversarial Prompt Tuning for Robust Inference in Vision-Language Models},
