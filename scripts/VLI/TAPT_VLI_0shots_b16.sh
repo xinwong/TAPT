@@ -1,7 +1,7 @@
 ## TAPT Adversarial Dataset Evaluation
 
 # custom config
-DATA="/path/to/your/CLIP/"
+DATA="/path/to/CLIP/"
 
 TRAINER=TAPTVLI
 
@@ -10,7 +10,7 @@ SEED=1
 EPOCHS=(100)
 ATTACKS=("ti" "cw")
 
-WEIGHTSPATH='/path/to/your/PromptLearning/Multimodal-Adversarial-Prompt-Tuning/output2025/train/imagenet/AdvIVLP/vit_b16_c2_ep100_batch32_2+2ctx_9depth_16shots'
+WEIGHTSPATH='/path/to/PromptLearning/Multimodal-Adversarial-Prompt-Tuning/output2025/train/imagenet/AdvIVLP/vit_b16_c2_ep100_batch32_2+2ctx_9depth_16shots'
 
 # Extract the common part from WEIGHTSPATH
 COMMON_PART=$(basename ${WEIGHTSPATH})
@@ -21,7 +21,7 @@ SHOTS=0
 MODEL_DIR=${WEIGHTSPATH}/seed${SEED}
 
 for ATTACK in "${ATTACKS[@]}"; do
-    ADV_DIR=/path/to/your/TAPT/output2025/evaluation/${ATTACK}/AdvIVLP
+    ADV_DIR=/path/to/TAPT/output2025/evaluation/${ATTACK}/AdvIVLP
 
     for DATASET in "${DATASETS[@]}"; do
         for LOADEP in "${EPOCHS[@]}"; do

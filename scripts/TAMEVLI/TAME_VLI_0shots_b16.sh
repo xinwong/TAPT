@@ -1,7 +1,7 @@
 ## TAPT-TAME Test-Time Evaluation (TAME-VLI, ViT-B/16, lane22_v1)
 
 # custom config
-DATA="/path/to/your/CLIP/"
+DATA="/path/to/CLIP/"
 
 TRAINER=TAMEVLI
 
@@ -10,7 +10,7 @@ SEED=1
 EPOCHS=(80)
 ATTACKS=("pgd" "di")
 
-WEIGHTSPATH='/path/to/your/PromptLearning/Multimodal-Adversarial-Prompt-Tuning/output2025/train/imagenet/MoEAdvIVLP/vit_b16_c2_ep100_batch32_2+2ctx_9depth_16shots'
+WEIGHTSPATH='/path/to/PromptLearning/Multimodal-Adversarial-Prompt-Tuning/output2025/train/imagenet/MoEAdvIVLP/vit_b16_c2_ep100_batch32_2+2ctx_9depth_16shots'
 
 COMMON_PART=$(basename ${WEIGHTSPATH})
 
@@ -21,7 +21,7 @@ MODEL_DIR=${WEIGHTSPATH}/seed${SEED}
 
 for ATTACK in "${ATTACKS[@]}"; do
 
-    ADV_DIR=/path/to/your/TAPT/output2025/evaluation/${ATTACK}/MoEAdvIVLP
+    ADV_DIR=/path/to/TAPT/output2025/evaluation/${ATTACK}/MoEAdvIVLP
 
     for DATASET in "${DATASETS[@]}"; do
         for LOADEP in "${EPOCHS[@]}"; do
